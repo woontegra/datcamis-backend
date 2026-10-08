@@ -5,7 +5,7 @@
   "description": "DatçaMis commerce API",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "build": "npm rebuild argon2 && prisma generate && tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -16,6 +16,12 @@
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
+  },
+  "allowScripts": {
+    "@prisma/client": true,
+    "@prisma/engines": true,
+    "argon2": true,
+    "prisma": true
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",
