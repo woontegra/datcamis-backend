@@ -9,9 +9,13 @@ import { signAccessToken } from "../common/tokens";
 import type { Env } from "../config/env";
 import { publicProductInclude, serializeProduct } from "../catalog/serialize";
 import { prisma } from "../db";
-import { pageDocumentSchema } from "../page-builder/schema";
+import { editorImageMimeTypes, editorMediaIds, homeEditorSlug, pageDocumentSchema, type PageDocument } from "../page-builder/schema";
 import { createPaymentProvider, createShippingProvider } from "../providers/commerce";
-import { assertSafeKey, type StorageAdapter } from "../storage/adapter";
+import { assertSafeKey } from "../storage/adapter";
+import type { MediaStorage } from "../storage/media-storage";
+import { storageStatus } from "../storage/persistence";
+import { cleanOriginalName, detectImage, matchesDeclared, safeFileName, UPLOAD_IMAGE_TYPES, UPLOAD_MAX_BYTES } from "../media/image";
+import { randomBytes } from "crypto";
 
 const listQuery = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -75,7 +79,22 @@ function serializeCart(cart: Awaited<ReturnType<typeof findCart>>) {
   };
 }
 
-export async function registerRoutes(app: FastifyInstance, env: Env, storage: StorageAdapter) {
+function isUniqueConflict(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
+}
+
+async function assertEditorMedia(document: PageDocument) {
+  const ids = editorMediaIds(document);
+  if (ids.length === 0) return;
+  const found = await prisma.media.count({
+    where: { id: { in: ids }, deletedAt: null, mimeType: { in: editorImageMimeTypes } },
+  });
+  if (found !== ids.length) {
+    throw new AppError(400, "MEDIA_NOT_ALLOWED", "Seçilen görsel Medya Kütüphanesinde bulunamadı.");
+  }
+}
+
+export async function registerRoutes(app: FastifyInstance, env: Env, storage: MediaStorage) {
   app.get("/api/v1/health", async () => {
     await prisma.$queryRaw`SELECT 1`;
     return { data: { status: "ok" } };
@@ -198,7 +217,8 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: St
       include: { publishedRevision: true },
     });
     if (!page?.publishedRevision) throw notFound("Sayfa bulunamadı.");
-    const document = parse(pageDocumentSchema, page.publishedRevision.document);
+    const parsed = parse(pageDocumentSchema, page.publishedRevision.document);
+    const document = parsed.version === 1 ? parsed : { version: 1 as const, sections: parsed.sections };
     const seo = await prisma.seoMetadata.findUnique({ where: { entityType_entityId: { entityType: "page", entityId: page.id } } });
     return { data: { slug: page.slug, title: page.title, document, seo } };
   });
@@ -239,9 +259,12 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: St
     const { id } = parse(z.object({ id: z.string() }), request.params);
     const media = await prisma.media.findFirst({ where: { id, deletedAt: null } });
     if (!media) throw notFound("Medya bulunamadı.");
-    const body = await storage.get(media.storageKey);
-    if (!body) throw notFound("Dosya bulunamadı.");
-    return reply.type(media.mimeType).send(body);
+    const file = await storage.read(media);
+    if (!file) throw notFound("Dosya bulunamadı.");
+    if (file.kind === "redirect") {
+      return reply.header("cache-control", "public, max-age=3600").redirect(file.url, 302);
+    }
+    return reply.type(media.mimeType).send(file.body);
   });
 
   app.post("/api/v1/carts", async () => {
@@ -596,6 +619,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: St
   app.get("/api/v1/admin/media", async (request) => {
     await requireStaff(request, env, ["OWNER", "ADMIN", "EDITOR"]);
     const rows = await prisma.media.findMany({ where: { deletedAt: null }, orderBy: { createdAt: "desc" } });
+    const status = storageStatus(env);
     return {
       data: rows.map((row) => ({
         id: row.id,
@@ -608,39 +632,91 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: St
         alt: row.alt,
         url: `/api/v1/media/${row.id}/file`,
       })),
+      meta: {
+        upload: status.persistent
+          ? { enabled: true, maxBytes: UPLOAD_MAX_BYTES, types: UPLOAD_IMAGE_TYPES }
+          : { enabled: false, maxBytes: UPLOAD_MAX_BYTES, types: UPLOAD_IMAGE_TYPES, message: status.message },
+      },
     };
   });
 
   app.post("/api/v1/admin/media", async (request) => {
     const staff = await requireStaff(request, env, ["OWNER", "ADMIN", "EDITOR"]);
-    const file = await request.file({ limits: { fileSize: 8 * 1024 * 1024 } });
-    if (!file) throw new AppError(400, "VALIDATION_ERROR", "Dosya gerekli.");
-    const allowed = new Set(["image/png", "image/jpeg", "image/webp", "image/svg+xml"]);
-    if (!allowed.has(file.mimetype)) throw new AppError(400, "UNSUPPORTED_MEDIA", "Bu dosya türü desteklenmiyor.");
-    const body = await file.toBuffer();
-    const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 80) || "dosya";
-    const key = `uploads/${Date.now()}-${safeName}`;
-    assertSafeKey(key);
-    if (env.STORAGE_PROVIDER !== "local") {
-      throw new AppError(501, "STORAGE_UNCONFIGURED", "Seçili depolama sağlayıcısı yapılandırılmamış.");
+    const status = storageStatus(env);
+    if (!status.persistent) throw new AppError(503, status.code, status.message);
+    if (!request.isMultipart()) throw new AppError(400, "UPLOAD_REQUIRED", "Görsel dosyası gönderilmedi.");
+
+    let file: Awaited<ReturnType<typeof request.file>>;
+    let body: Buffer;
+    try {
+      file = await request.file({ limits: { fileSize: UPLOAD_MAX_BYTES, files: 1, fields: 0, parts: 1 } });
+      if (!file) throw new AppError(400, "UPLOAD_REQUIRED", "Görsel dosyası gönderilmedi.");
+      body = await file.toBuffer();
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      const code = (error as { code?: string }).code;
+      if (code === "FST_REQ_FILE_TOO_LARGE") throw new AppError(413, "FILE_TOO_LARGE", "Dosya 8 MB sınırını aşıyor. Daha küçük bir görsel seçin.");
+      throw new AppError(400, "UPLOAD_FAILED", "Dosya okunamadı. Tek bir görsel seçip tekrar deneyin.");
     }
-    await storage.put(key, body);
-    const media = await prisma.media.create({
+    if (file.file.truncated) throw new AppError(413, "FILE_TOO_LARGE", "Dosya 8 MB sınırını aşıyor. Daha küçük bir görsel seçin.");
+    if (body.length === 0) throw new AppError(400, "EMPTY_FILE", "Dosya boş.");
+    if (!(UPLOAD_IMAGE_TYPES as string[]).includes(file.mimetype)) {
+      throw new AppError(400, "UNSUPPORTED_MEDIA", "Yalnızca JPG, PNG veya WebP görseller yüklenebilir.");
+    }
+    const image = detectImage(body);
+    if (!image) throw new AppError(400, "INVALID_IMAGE", "Dosya içeriği geçerli bir JPG, PNG veya WebP görseli değil.");
+    if (!matchesDeclared(image, file.mimetype, file.filename)) {
+      throw new AppError(400, "INVALID_IMAGE", "Dosyanın uzantısı, türü ve içeriği birbiriyle uyuşmuyor.");
+    }
+
+    // Keys never contain user input; the original name is only kept as text.
+    const key = `uploads/${randomBytes(16).toString("hex")}.${image.extension}`;
+    assertSafeKey(key);
+    const filename = safeFileName(file.filename, image.extension);
+    const saved = await storage.save(key, body, image.mimeType, request.log);
+    let media;
+    try {
+      media = await prisma.$transaction(async (tx) => {
+        const row = await tx.media.create({
+          data: {
+            storageProvider: saved.storageProvider,
+            storageKey: saved.storageKey,
+            filename,
+            originalName: cleanOriginalName(file.filename),
+            mimeType: image.mimeType,
+            sizeBytes: body.length,
+            width: image.width,
+            height: image.height,
+            alt: "",
+            metadata: saved.storage ? { uploadedBy: staff.id, storage: saved.storage } : { uploadedBy: staff.id },
+          },
+        });
+        await tx.auditLog.create({
+          data: { actorId: staff.id, action: "media.upload", entityType: "media", entityId: row.id },
+        });
+        return row;
+      });
+    } catch (error) {
+      // Without a database row nobody can reach the stored object, so remove it rather than leave an orphan.
+      await storage.discard(saved).catch((cleanup) => {
+        request.log.error({ err: cleanup, storageKey: saved.storageKey }, "Yarım kalan medya nesnesi silinemedi");
+      });
+      request.log.error({ err: error, storageKey: saved.storageKey }, "Medya kaydı oluşturulamadı");
+      throw new AppError(500, "MEDIA_SAVE_FAILED", "Görsel kaydedilemedi. Lütfen tekrar deneyin.");
+    }
+    return {
       data: {
-        storageProvider: "LOCAL",
-        storageKey: key,
-        filename: safeName,
-        originalName: file.filename,
-        mimeType: file.mimetype,
-        sizeBytes: body.length,
-        alt: "",
-        metadata: { uploadedBy: staff.id },
+        id: media.id,
+        filename: media.filename,
+        originalName: media.originalName,
+        mimeType: media.mimeType,
+        sizeBytes: media.sizeBytes,
+        width: media.width,
+        height: media.height,
+        alt: media.alt,
+        url: `/api/v1/media/${media.id}/file`,
       },
-    });
-    await prisma.auditLog.create({
-      data: { actorId: staff.id, action: "media.upload", entityType: "media", entityId: media.id },
-    });
-    return { data: { id: media.id, url: `/api/v1/media/${media.id}/file` } };
+    };
   });
 
   app.get("/api/v1/admin/pages", async (request) => {
@@ -682,33 +758,56 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: St
       }),
       request.body,
     );
-    const page = await prisma.page.create({
-      data: {
-        title: body.title,
-        slug: body.slug,
-        status: "DRAFT",
-        revisions: { create: { version: 1, status: "DRAFT", document: body.document, createdById: staff.id } },
-      },
-    });
-    return { data: page };
+    await assertEditorMedia(body.document);
+    const existing = await prisma.page.findFirst({ where: { slug: body.slug, deletedAt: null } });
+    if (existing) throw new AppError(409, "SLUG_TAKEN", "Bu adres kullanılıyor.");
+    try {
+      const page = await prisma.page.create({
+        data: {
+          title: body.title,
+          slug: body.slug,
+          status: "DRAFT",
+          revisions: { create: { version: 1, status: "DRAFT", document: body.document, createdById: staff.id } },
+        },
+      });
+      return { data: page };
+    } catch (error) {
+      if (isUniqueConflict(error)) throw new AppError(409, "SLUG_TAKEN", "Bu adres kullanılıyor.");
+      throw error;
+    }
   });
 
   app.post("/api/v1/admin/pages/:id/revisions", async (request) => {
     const staff = await requireStaff(request, env, ["OWNER", "ADMIN", "EDITOR"]);
     const { id } = parse(z.object({ id: z.string() }), request.params);
-    const body = parse(z.object({ document: pageDocumentSchema }), request.body);
+    const body = parse(z.object({
+      document: pageDocumentSchema,
+      baseVersion: z.number().int().min(0).optional(),
+    }), request.body);
+    await assertEditorMedia(body.document);
     const page = await prisma.page.findFirst({ where: { id, deletedAt: null }, include: { revisions: { orderBy: { version: "desc" }, take: 1 } } });
     if (!page) throw notFound("Sayfa bulunamadı.");
-    const revision = await prisma.pageRevision.create({
-      data: {
-        pageId: page.id,
-        version: (page.revisions[0]?.version ?? 0) + 1,
-        status: "DRAFT",
-        document: body.document,
-        createdById: staff.id,
-      },
-    });
-    return { data: revision };
+    const latest = page.revisions[0]?.version ?? 0;
+    if (body.baseVersion !== undefined && body.baseVersion !== latest) {
+      throw new AppError(409, "REVISION_CONFLICT", "Bu taslak başka bir yerde güncellendi. Kaydetmek için sayfayı yeniden yükleyin.");
+    }
+    try {
+      const revision = await prisma.pageRevision.create({
+        data: {
+          pageId: page.id,
+          version: latest + 1,
+          status: "DRAFT",
+          document: body.document,
+          createdById: staff.id,
+        },
+      });
+      return { data: revision };
+    } catch (error) {
+      if (isUniqueConflict(error)) {
+        throw new AppError(409, "REVISION_CONFLICT", "Bu taslak başka bir yerde güncellendi. Kaydetmek için sayfayı yeniden yükleyin.");
+      }
+      throw error;
+    }
   });
 
   app.post("/api/v1/admin/pages/:id/publish", async (request) => {
@@ -720,6 +819,9 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: St
     });
     const revision = page?.revisions[0];
     if (!page || !revision) throw notFound("Yayınlanacak taslak yok.");
+    if (page.slug === homeEditorSlug) {
+      throw new AppError(409, "PUBLISH_UNSUPPORTED", "Mağaza ana sayfasına yayınlama henüz desteklenmiyor.");
+    }
     const updated = await prisma.page.update({
       where: { id: page.id },
       data: { status: "PUBLISHED", publishedRevisionId: revision.id },

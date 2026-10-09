@@ -10,8 +10,18 @@ const schema = z.object({
   ACCESS_TOKEN_TTL: z.string().default("15m"),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
   CORS_ORIGINS: z.string().default("http://localhost:3010"),
-  STORAGE_PROVIDER: z.enum(["local", "s3"]).default("local"),
+  STORAGE_PROVIDER: z.enum(["local", "blob", "s3"]).default("local"),
+  // Server-only Vercel Blob credential; never forward it to the storefront or a NEXT_PUBLIC_ variable.
+  BLOB_READ_WRITE_TOKEN: z
+    .string()
+    .optional()
+    .transform((value) => value?.trim() || undefined),
   STORAGE_LOCAL_ROOT: z.string().default("storage"),
+  // Set to "true" only when STORAGE_LOCAL_ROOT is on a disk that survives restarts and deploys.
+  STORAGE_PERSISTENT: z.enum(["true", "false"]).optional(),
+  RAILWAY_ENVIRONMENT: z.string().optional(),
+  RAILWAY_ENVIRONMENT_NAME: z.string().optional(),
+  RAILWAY_VOLUME_MOUNT_PATH: z.string().optional(),
   S3_BUCKET: z.string().optional(),
   S3_ENDPOINT: z.string().optional(),
   S3_REGION: z.string().optional(),

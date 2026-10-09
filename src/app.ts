@@ -8,7 +8,9 @@ import path from "path";
 import { AppError } from "./common/errors";
 import type { Env } from "./config/env";
 import { registerRoutes } from "./routes/register";
-import { LocalStorageAdapter, S3StorageAdapter, type StorageAdapter } from "./storage/adapter";
+import { LocalStorageAdapter } from "./storage/adapter";
+import { BlobStorage } from "./storage/blob";
+import { MediaStorage } from "./storage/media-storage";
 
 export async function buildApp(env: Env) {
   const app = Fastify({
@@ -19,16 +21,8 @@ export async function buildApp(env: Env) {
     trustProxy: env.NODE_ENV === "production",
   });
 
-  const storage: StorageAdapter =
-    env.STORAGE_PROVIDER === "s3"
-      ? new S3StorageAdapter({
-          bucket: env.S3_BUCKET,
-          endpoint: env.S3_ENDPOINT,
-          region: env.S3_REGION,
-          accessKeyId: env.S3_ACCESS_KEY_ID,
-          secretAccessKey: env.S3_SECRET_ACCESS_KEY,
-        })
-      : new LocalStorageAdapter(path.resolve(env.STORAGE_LOCAL_ROOT));
+  // Local storage stays available for reading older local media even when new uploads go to Vercel Blob.
+  const storage = new MediaStorage(env, new LocalStorageAdapter(path.resolve(env.STORAGE_LOCAL_ROOT)), new BlobStorage(env.BLOB_READ_WRITE_TOKEN));
 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, { origin: env.corsOrigins, credentials: true });

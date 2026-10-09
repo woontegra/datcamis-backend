@@ -1,9 +1,12 @@
 node_modules
 .env
-.env.local
+.env.*
+!.env.example
 dist
 build
 .next
 coverage
 logs
 *.log
+storage/uploads/*
+!storage/uploads/.gitkeep
