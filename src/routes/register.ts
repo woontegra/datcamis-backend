@@ -15,6 +15,7 @@ import { assertSafeKey } from "../storage/adapter";
 import type { MediaStorage } from "../storage/media-storage";
 import { storageStatus } from "../storage/persistence";
 import { cleanOriginalName, detectImage, matchesDeclared, safeFileName, UPLOAD_IMAGE_TYPES, UPLOAD_MAX_BYTES } from "../media/image";
+import { imageUsage, optimizeImage } from "../media/optimize";
 import { randomBytes } from "crypto";
 
 const listQuery = z.object({
@@ -668,12 +669,15 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     if (!matchesDeclared(image, file.mimetype, file.filename)) {
       throw new AppError(400, "INVALID_IMAGE", "Dosyanın uzantısı, türü ve içeriği birbiriyle uyuşmuyor.");
     }
+    // The usage only picks the size limit, so it comes from the query string and the single-file form stays strict.
+    const usage = imageUsage((request.query as { usage?: unknown } | undefined)?.usage);
+    const optimized = await optimizeImage(body, image, usage, request.log);
 
     // Keys never contain user input; the original name is only kept as text.
-    const key = `uploads/${randomBytes(16).toString("hex")}.${image.extension}`;
+    const key = `uploads/${randomBytes(16).toString("hex")}.${optimized.extension}`;
     assertSafeKey(key);
-    const filename = safeFileName(file.filename, image.extension);
-    const saved = await storage.save(key, body, image.mimeType, request.log);
+    const filename = safeFileName(file.filename, optimized.extension);
+    const saved = await storage.save(key, optimized.body, optimized.mimeType, request.log);
     let media;
     try {
       media = await prisma.$transaction(async (tx) => {
@@ -683,12 +687,16 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
             storageKey: saved.storageKey,
             filename,
             originalName: cleanOriginalName(file.filename),
-            mimeType: image.mimeType,
-            sizeBytes: body.length,
-            width: image.width,
-            height: image.height,
+            mimeType: optimized.mimeType,
+            sizeBytes: optimized.body.length,
+            width: optimized.width,
+            height: optimized.height,
             alt: "",
-            metadata: saved.storage ? { uploadedBy: staff.id, storage: saved.storage } : { uploadedBy: staff.id },
+            metadata: {
+              uploadedBy: staff.id,
+              optimization: optimized.report,
+              ...(saved.storage ? { storage: saved.storage } : {}),
+            },
           },
         });
         await tx.auditLog.create({
@@ -715,6 +723,12 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
         height: media.height,
         alt: media.alt,
         url: `/api/v1/media/${media.id}/file`,
+        optimization: {
+          originalBytes: optimized.report.originalBytes,
+          outputBytes: optimized.report.outputBytes,
+          outputFormat: optimized.report.outputFormat,
+          savingsPercent: optimized.report.savingsPercent,
+        },
       },
     };
   });

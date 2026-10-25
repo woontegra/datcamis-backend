@@ -1,5 +1,6 @@
 import path from "path";
 import { existsSync } from "fs";
+import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { buildApp } from "../src/app";
 import { loadEnv } from "../src/config/env";
@@ -9,6 +10,7 @@ import { signAccessToken } from "../src/common/tokens";
 import { LocalStorageAdapter } from "../src/storage/adapter";
 import { storageStatus } from "../src/storage/persistence";
 import { detectImage, safeFileName, UPLOAD_MAX_BYTES } from "../src/media/image";
+import { photoJpeg, photoPng, photoWebp, transparentPng } from "./helpers/images";
 
 loadDotEnv();
 const env = loadEnv();
@@ -47,9 +49,9 @@ function multipart(filename: string, type: string, content: Buffer, extra?: { na
   return { payload: Buffer.concat(parts), headers: { "content-type": `multipart/form-data; boundary=${boundary}` } };
 }
 
-async function upload(target: typeof app, auth: Record<string, string>, filename: string, type: string, content: Buffer) {
+async function upload(target: typeof app, auth: Record<string, string>, filename: string, type: string, content: Buffer, query = "") {
   const body = multipart(filename, type, content);
-  const response = await target.inject({ method: "POST", url: "/api/v1/admin/media", headers: { ...body.headers, ...auth }, payload: body.payload });
+  const response = await target.inject({ method: "POST", url: `/api/v1/admin/media${query}`, headers: { ...body.headers, ...auth }, payload: body.payload });
   if (response.statusCode === 200) created.push(response.json().data.id);
   return response;
 }
@@ -122,26 +124,36 @@ describe("POST /api/v1/admin/media", () => {
     expect(forbidden.json().error.message).toBe("Bu işlem için yetkiniz yok.");
   });
 
-  test("JPG, PNG ve WebP yükler, rastgele anahtarla saklar ve listede gösterir", async () => {
-    const files: [string, string, Buffer, string][] = [
-      ["Zeytin Bahçesi.png", "image/png", PNG, "png"],
-      ["limon.jpeg", "image/jpeg", JPEG, "jpg"],
-      ["badem.webp", "image/webp", WEBP, "webp"],
+  test("JPG, PNG ve WebP'yi optimize edip WebP olarak saklar, listede gösterir", async () => {
+    const files: [string, string, Buffer, string, string][] = [
+      ["Zeytin Bahçesi.png", "image/png", await photoPng(1800, 1200), "png", "zeytin-bahcesi.webp"],
+      ["limon.jpeg", "image/jpeg", await photoJpeg(1800, 1200), "jpg", "limon.webp"],
+      ["badem.webp", "image/webp", await photoWebp(1800, 1200), "webp", "badem.webp"],
     ];
-    for (const [name, type, content, extension] of files) {
+    for (const [name, type, content, originalFormat, filename] of files) {
       const response = await upload(app, { cookie: ownerCookie }, name, type, content);
-      expect(response.statusCode).toBe(200);
+      expect(response.statusCode, name).toBe(200);
       const data = response.json().data;
-      expect(data).toMatchObject({ mimeType: type, width: 1, height: 1, sizeBytes: content.length, url: `/api/v1/media/${data.id}/file` });
+      expect(data).toMatchObject({ filename, mimeType: "image/webp", width: 1600, height: 1067, url: `/api/v1/media/${data.id}/file` });
+      expect(data.sizeBytes).toBeLessThan(content.length);
+      expect(data.optimization).toMatchObject({ originalBytes: content.length, outputBytes: data.sizeBytes, outputFormat: "webp" });
+      expect(data.optimization.savingsPercent).toBeGreaterThan(0);
+
       const row = await prisma.media.findUniqueOrThrow({ where: { id: data.id } });
-      expect(row.storageKey).toMatch(new RegExp(`^uploads/[a-f0-9]{32}\\.${extension}$`));
-      expect(existsSync(path.resolve(env.STORAGE_LOCAL_ROOT, row.storageKey))).toBe(true);
+      expect(row.storageKey).toMatch(/^uploads\/[a-f0-9]{32}\.webp$/);
+      expect(row).toMatchObject({ mimeType: "image/webp", sizeBytes: data.sizeBytes, width: 1600, height: 1067 });
+      expect(row.metadata).toMatchObject({
+        optimization: { usage: "general", maxSide: 1600, originalFormat, originalBytes: content.length, outputFormat: "webp", outputBytes: data.sizeBytes },
+      });
+      const stored = path.resolve(env.STORAGE_LOCAL_ROOT, row.storageKey);
+      expect(existsSync(stored)).toBe(true);
 
       const file = await app.inject({ method: "GET", url: data.url });
       expect(file.statusCode).toBe(200);
-      expect(file.headers["content-type"]).toContain(type);
+      expect(file.headers["content-type"]).toContain("image/webp");
       expect(file.headers["x-content-type-options"]).toBe("nosniff");
-      expect(file.rawPayload.equals(content)).toBe(true);
+      expect(file.rawPayload.length).toBe(data.sizeBytes);
+      expect(detectImage(file.rawPayload)).toMatchObject({ mimeType: "image/webp", width: 1600, height: 1067 });
     }
     expect(created).toHaveLength(3);
 
@@ -151,12 +163,43 @@ describe("POST /api/v1/admin/media", () => {
     expect(body.meta.upload).toMatchObject({ enabled: true, maxBytes: UPLOAD_MAX_BYTES });
   });
 
+  test("hero görseli 2400 px sınırını kullanır, şeffaf PNG saydam kalır", async () => {
+    const hero = await upload(app, { cookie: ownerCookie }, "hero.jpg", "image/jpeg", await photoJpeg(3000, 2000), "?usage=hero");
+    expect(hero.statusCode).toBe(200);
+    expect(hero.json().data).toMatchObject({ mimeType: "image/webp", width: 2400, height: 1600 });
+    const general = await upload(app, { cookie: ownerCookie }, "genel.jpg", "image/jpeg", await photoJpeg(3000, 2000), "?usage=bilinmeyen");
+    expect(general.json().data).toMatchObject({ width: 1600, height: 1067 });
+
+    const logo = await upload(app, { cookie: ownerCookie }, "logo.png", "image/png", await transparentPng(400, 300), "?usage=logo");
+    expect(logo.statusCode).toBe(200);
+    const file = await app.inject({ method: "GET", url: logo.json().data.url });
+    expect((await sharp(file.rawPayload).metadata()).hasAlpha).toBe(true);
+
+    const garden = await upload(app, { cookie: ownerCookie }, "bahce.png", "image/png", await transparentPng(400, 3500), "?usage=decorative");
+    expect(garden.statusCode).toBe(200);
+    expect(garden.json().data).toMatchObject({ mimeType: "image/webp", width: 400, height: 3500 });
+    const row = await prisma.media.findUniqueOrThrow({ where: { id: garden.json().data.id } });
+    expect(row.metadata).toMatchObject({ optimization: { usage: "decorative", maxShortSide: 1200, outputWidth: 400, outputHeight: 3500 } });
+  });
+
+  test("bozuk görseli kaydetmeden Türkçe hatayla reddeder", async () => {
+    const jpeg = await photoJpeg(1200, 800);
+    const before = await prisma.media.count();
+    const response = await upload(app, { cookie: ownerCookie }, "bozuk.jpg", "image/jpeg", jpeg.subarray(0, Math.floor(jpeg.length * 0.6)));
+    expect(response.statusCode).toBe(422);
+    expect(response.json().error).toEqual({
+      code: "IMAGE_PROCESSING_FAILED",
+      message: "Görsel optimize edilemedi; dosya bozuk olabilir. Görseli yeniden kaydedip tekrar deneyin.",
+    });
+    expect(await prisma.media.count()).toBe(before);
+  });
+
   test("tehlikeli dosya adı anahtara karışmaz", async () => {
-    const response = await upload(app, { cookie: ownerCookie }, "../../etc/passwd.png", "image/png", PNG);
+    const response = await upload(app, { cookie: ownerCookie }, "../../etc/passwd.png", "image/png", await photoPng(64, 64));
     expect(response.statusCode).toBe(200);
     const row = await prisma.media.findUniqueOrThrow({ where: { id: response.json().data.id } });
-    expect(row.storageKey).toMatch(/^uploads\/[a-f0-9]{32}\.png$/);
-    expect(row.filename).toMatch(/^[a-z0-9-]+\.png$/);
+    expect(row.storageKey).toMatch(/^uploads\/[a-f0-9]{32}\.webp$/);
+    expect(row.filename).toMatch(/^[a-z0-9-]+\.webp$/);
     expect(row.originalName).not.toMatch(/[\\/]|\.\./);
   });
 

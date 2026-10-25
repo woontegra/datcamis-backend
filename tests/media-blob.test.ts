@@ -1,5 +1,6 @@
 import path from "path";
 import { readdirSync } from "fs";
+import sharp from "sharp";
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 const blob = vi.hoisted(() => ({
@@ -13,8 +14,10 @@ import { buildApp } from "../src/app";
 import { loadEnv } from "../src/config/env";
 import { loadDotEnv } from "../src/load-env";
 import { prisma } from "../src/db";
+import { detectImage } from "../src/media/image";
 import { blobTokenProblem, isBlobUrl, readBlobLocation } from "../src/storage/blob";
 import { storageStatus } from "../src/storage/persistence";
+import { photoJpeg, transparentPng } from "./helpers/images";
 
 loadDotEnv();
 const base = loadEnv();
@@ -25,8 +28,6 @@ const STORE = "https://teststore.public.blob.vercel-storage.com";
 const PAGE_SLUG = "blob-taslak-test";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
-const WEBP = Buffer.from("UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA", "base64");
-
 let app: Awaited<ReturnType<typeof buildApp>>;
 let cookie = "";
 const created: string[] = [];
@@ -42,9 +43,9 @@ function multipart(filename: string, type: string, content: Buffer) {
   return { payload, headers: { "content-type": `multipart/form-data; boundary=${boundary}` } };
 }
 
-async function upload(target: typeof app, filename: string, type: string, content: Buffer) {
+async function upload(target: typeof app, filename: string, type: string, content: Buffer, query = "") {
   const body = multipart(filename, type, content);
-  const response = await target.inject({ method: "POST", url: "/api/v1/admin/media", headers: { ...body.headers, cookie }, payload: body.payload });
+  const response = await target.inject({ method: "POST", url: `/api/v1/admin/media${query}`, headers: { ...body.headers, cookie }, payload: body.payload });
   if (response.statusCode === 200) created.push(response.json().data.id);
   return response;
 }
@@ -138,24 +139,30 @@ describe("Vercel Blob yapılandırması", () => {
 });
 
 describe("Blob ile yükleme ve okuma", () => {
-  test("görseli benzersiz adla Blob'a yükler, kimliği ve konumu Media kaydına yazar", async () => {
+  test("yalnızca optimize edilmiş WebP'yi benzersiz adla Blob'a yükler, kimliği ve konumu Media kaydına yazar", async () => {
     storedBlob();
-    const response = await upload(app, "Datça Zeytin.webp", "image/webp", WEBP);
+    const original = await photoJpeg(3000, 2000);
+    const response = await upload(app, "Datça Zeytin.jpg", "image/jpeg", original, "?usage=hero");
     expect(response.statusCode).toBe(200);
     const data = response.json().data;
-    expect(data).toMatchObject({ mimeType: "image/webp", width: 1, height: 1, url: `/api/v1/media/${data.id}/file` });
+    expect(data).toMatchObject({ mimeType: "image/webp", width: 2400, height: 1600, url: `/api/v1/media/${data.id}/file` });
     expect(JSON.stringify(response.json())).not.toContain(TOKEN);
     expect(JSON.stringify(response.json())).not.toContain("blob.vercel-storage.com");
 
     expect(blob.put).toHaveBeenCalledTimes(1);
     const [pathname, body, options] = blob.put.mock.calls[0];
     expect(pathname).toMatch(/^uploads\/[a-f0-9]{32}\.webp$/);
-    expect(Buffer.compare(body, WEBP)).toBe(0);
+    expect(body.equals(original)).toBe(false);
+    expect(body.length).toBeLessThan(original.length);
+    expect(detectImage(body)).toMatchObject({ mimeType: "image/webp", width: 2400, height: 1600 });
     expect(options).toMatchObject({ access: "public", token: TOKEN, contentType: "image/webp", addRandomSuffix: false, allowOverwrite: false });
 
     const row = await prisma.media.findUniqueOrThrow({ where: { id: data.id } });
-    expect(row).toMatchObject({ storageProvider: "S3", storageKey: pathname, filename: "datca-zeytin.webp", sizeBytes: WEBP.length });
-    expect(row.metadata).toMatchObject({ storage: { provider: "vercel-blob", url: `${STORE}/${pathname}`, pathname } });
+    expect(row).toMatchObject({ storageProvider: "S3", storageKey: pathname, filename: "datca-zeytin.webp", mimeType: "image/webp", sizeBytes: body.length });
+    expect(row.metadata).toMatchObject({
+      storage: { provider: "vercel-blob", url: `${STORE}/${pathname}`, pathname },
+      optimization: { usage: "hero", maxSide: 2400, originalFormat: "jpg", originalBytes: original.length, outputFormat: "webp", outputBytes: body.length },
+    });
     expect(readdirSync(path.resolve(base.STORAGE_LOCAL_ROOT, "uploads")).sort()).toEqual(uploadsBefore);
 
     const file = await app.inject({ method: "GET", url: data.url });
@@ -217,10 +224,26 @@ describe("Blob ile yükleme ve okuma", () => {
     expect(blob.put).not.toHaveBeenCalled();
   });
 
+  test("optimizasyon başarısız olursa orijinal dosya Blob'a gönderilmez", async () => {
+    storedBlob();
+    const jpeg = await photoJpeg(1200, 800);
+    const before = await prisma.media.count();
+    const broken = await upload(app, "bozuk.jpg", "image/jpeg", jpeg.subarray(0, Math.floor(jpeg.length * 0.6)));
+    expect(broken.statusCode).toBe(422);
+    expect(broken.json().error.code).toBe("IMAGE_PROCESSING_FAILED");
+    const huge = await upload(app, "dev.png", "image/png", await sharp({ create: { width: 8000, height: 7000, channels: 3, background: "#ffffff" } }).png().toBuffer());
+    expect(huge.statusCode).toBe(400);
+    expect(huge.json().error.code).toBe("IMAGE_TOO_LARGE");
+    expect(blob.put).not.toHaveBeenCalled();
+    expect(await prisma.media.count()).toBe(before);
+  });
+
   test("Blob hatasında kayıt oluşturmaz ve Türkçe hata döner", async () => {
     blob.put.mockRejectedValue(Object.assign(new Error(`Vercel Blob: Access denied ${TOKEN}`), { name: "BlobAccessError" }));
     const before = await prisma.media.count();
-    const response = await upload(app, "a.png", "image/png", PNG);
+    const response = await upload(app, "logo.png", "image/png", await transparentPng(400, 300));
+    expect(blob.put).toHaveBeenCalledTimes(1);
+    expect(blob.put.mock.calls[0][2]).toMatchObject({ contentType: "image/webp" });
     expect(response.statusCode).toBe(502);
     expect(response.json().error).toEqual({ code: "STORAGE_UPLOAD_FAILED", message: "Görsel depolamaya yüklenemedi. Lütfen biraz sonra tekrar deneyin." });
     expect(response.body).not.toContain(TOKEN);
