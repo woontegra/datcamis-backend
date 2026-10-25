@@ -9,7 +9,7 @@ import { signAccessToken } from "../common/tokens";
 import type { Env } from "../config/env";
 import { publicProductInclude, serializeProduct } from "../catalog/serialize";
 import { prisma } from "../db";
-import { editorImageMimeTypes, editorMediaIds, homeEditorSlug, pageDocumentSchema, type PageDocument } from "../page-builder/schema";
+import { editorImageMimeTypes, editorMediaIds, pageDocumentSchema, type PageDocument } from "../page-builder/schema";
 import { createPaymentProvider, createShippingProvider } from "../providers/commerce";
 import { assertSafeKey } from "../storage/adapter";
 import type { MediaStorage } from "../storage/media-storage";
@@ -218,8 +218,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
       include: { publishedRevision: true },
     });
     if (!page?.publishedRevision) throw notFound("Sayfa bulunamadı.");
-    const parsed = parse(pageDocumentSchema, page.publishedRevision.document);
-    const document = parsed.version === 1 ? parsed : { version: 1 as const, sections: parsed.sections };
+    const document = parse(pageDocumentSchema, page.publishedRevision.document);
     const seo = await prisma.seoMetadata.findUnique({ where: { entityType_entityId: { entityType: "page", entityId: page.id } } });
     return { data: { slug: page.slug, title: page.title, document, seo } };
   });
@@ -833,9 +832,6 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     });
     const revision = page?.revisions[0];
     if (!page || !revision) throw notFound("Yayınlanacak taslak yok.");
-    if (page.slug === homeEditorSlug) {
-      throw new AppError(409, "PUBLISH_UNSUPPORTED", "Mağaza ana sayfasına yayınlama henüz desteklenmiyor.");
-    }
     const updated = await prisma.page.update({
       where: { id: page.id },
       data: { status: "PUBLISHED", publishedRevisionId: revision.id },

@@ -530,8 +530,8 @@ test("ana sayfa taslağı yayınlanmaz, eski revizyon kalır ve çakışan kayı
     const response = await app.inject({ method: "GET", url: `/api/v1/content/pages/${page.slug}` });
     expect(response.statusCode).toBe(200);
     const document = response.json().data.document;
-    expect(document.version).toBe(1);
-    expect(document.editor).toBeUndefined();
+    expect([1, 2]).toContain(document.version);
+    if (document.version === 1) expect(document.editor).toBeUndefined();
   }
 
   const login = await app.inject({
@@ -728,7 +728,7 @@ test("ana sayfa taslağı yayınlanmaz, eski revizyon kalır ve çakışan kayı
   expect(stillHidden.statusCode).toBe(404);
 });
 
-test("ana sayfa taslağı yayınlanamaz, başka bir CMS sayfası yayınlanır", async () => {
+test("taslak gizlenir, onaylanan revizyon canlıda editor belgesini döner", async () => {
   const before = await prisma.page.findMany({
     where: { status: "PUBLISHED", deletedAt: null, slug: { notIn: ["ana-sayfa", "yayin-deneme-test"] } },
     select: { id: true, publishedRevisionId: true },
@@ -739,26 +739,19 @@ test("ana sayfa taslağı yayınlanamaz, başka bir CMS sayfası yayınlanır", 
     payload: { email: process.env.SEED_ADMIN_EMAIL, password: process.env.SEED_ADMIN_PASSWORD },
   });
   const cookie = accessCookie(login.headers["set-cookie"]);
-  // The real homepage draft belongs to the user: only inspect it, never create or delete it here.
+  // The real homepage draft belongs to the user: only inspect it, never publish or delete it here.
   const home = await prisma.page.findFirst({
     where: { slug: "ana-sayfa", deletedAt: null },
-    include: { _count: { select: { revisions: true } } },
+    include: { publishedRevision: true },
   });
   if (home) {
-    const denied = await app.inject({
-      method: "POST",
-      url: `/api/v1/admin/pages/${home.id}/publish`,
-      headers: { cookie },
-    });
-    expect(denied.statusCode).toBe(409);
-    expect(denied.json().error.code).toBe("PUBLISH_UNSUPPORTED");
-    const homeAfter = await prisma.page.findFirstOrThrow({
-      where: { id: home.id },
-      include: { _count: { select: { revisions: true } } },
-    });
-    expect(homeAfter.status).toBe(home.status);
-    expect(homeAfter.publishedRevisionId).toBe(home.publishedRevisionId);
-    expect(homeAfter._count.revisions).toBe(home._count.revisions);
+    const publicHome = await app.inject({ method: "GET", url: "/api/v1/content/pages/ana-sayfa" });
+    if (home.publishedRevisionId) {
+      expect(publicHome.statusCode).toBe(200);
+      expect([1, 2]).toContain(publicHome.json().data.document.version);
+    } else {
+      expect(publicHome.statusCode).toBe(404);
+    }
   }
 
   await removePage("yayin-deneme-test");
@@ -766,10 +759,12 @@ test("ana sayfa taslağı yayınlanamaz, başka bir CMS sayfası yayınlanır", 
     method: "POST",
     url: "/api/v1/admin/pages",
     headers: { cookie },
-    payload: { title: "Yayın denemesi", slug: "yayin-deneme-test", document: version1() },
+    payload: { title: "Yayın denemesi", slug: "yayin-deneme-test", document: version2("Canlı başlık") },
   });
   expect(other.statusCode).toBe(200);
   const otherId = other.json().data.id as string;
+  const hidden = await app.inject({ method: "GET", url: "/api/v1/content/pages/yayin-deneme-test" });
+  expect(hidden.statusCode).toBe(404);
   const published = await app.inject({
     method: "POST",
     url: `/api/v1/admin/pages/${otherId}/publish`,
@@ -778,8 +773,8 @@ test("ana sayfa taslağı yayınlanamaz, başka bir CMS sayfası yayınlanır", 
   expect(published.statusCode).toBe(200);
   const visible = await app.inject({ method: "GET", url: "/api/v1/content/pages/yayin-deneme-test" });
   expect(visible.statusCode).toBe(200);
-  expect(visible.json().data.document.version).toBe(1);
-  expect(visible.json().data.document.editor).toBeUndefined();
+  expect(visible.json().data.document.version).toBe(2);
+  expect(visible.json().data.document.editor.copies["home.hero.title"].text).toBe("Canlı başlık");
 
   const after = await prisma.page.findMany({
     where: { status: "PUBLISHED", deletedAt: null, slug: { notIn: ["ana-sayfa", "yayin-deneme-test"] } },
