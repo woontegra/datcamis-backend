@@ -22,6 +22,7 @@ enum RecordStatus {
 enum ProductStatus {
   DRAFT
   ACTIVE
+  DISABLED
   ARCHIVED
 }
 
@@ -45,6 +46,7 @@ enum OrderStatus {
   SHIPPED
   DELIVERED
   CANCELLED
+  RETURNED
 }
 
 enum PaymentStatus {
@@ -148,21 +150,26 @@ model Address {
 }
 
 model Product {
-  id          String              @id @default(cuid())
-  slug        String              @unique
-  name        String
-  summary     String
-  description String
-  status      ProductStatus       @default(DRAFT)
-  isSeed      Boolean             @default(false)
-  deletedAt   DateTime?
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
-  variants    ProductVariant[]
-  images      ProductImage[]
-  options     ProductOption[]
-  categories  ProductCategory[]
-  collections ProductCollection[]
+  id            String              @id @default(cuid())
+  slug          String              @unique
+  name          String
+  summary       String
+  description   String
+  content       String              @default("")
+  usageNotes    String              @default("")
+  warningNotes  String              @default("")
+  featured      Boolean             @default(false)
+  vatRate       Int?
+  status        ProductStatus       @default(DRAFT)
+  isSeed        Boolean             @default(false)
+  deletedAt     DateTime?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  variants      ProductVariant[]
+  images        ProductImage[]
+  options       ProductOption[]
+  categories    ProductCategory[]
+  collections   ProductCollection[]
 
   @@index([status, deletedAt])
   @@map("products")
@@ -193,22 +200,29 @@ model ProductOptionValue {
 }
 
 model ProductVariant {
-  id         String               @id @default(cuid())
-  productId  String
-  product    Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
-  sku        String               @unique
-  name       String
-  priceAmount Int
-  currency   String               @default("TRY")
-  weightGrams Int?
-  isDefault  Boolean              @default(false)
-  deletedAt  DateTime?
-  createdAt  DateTime             @default(now())
-  updatedAt  DateTime             @updatedAt
-  inventory  InventoryItem?
-  optionValues VariantOptionValue[]
-  cartItems  CartItem[]
-  orderItems OrderItem[]
+  id              String               @id @default(cuid())
+  productId       String
+  product         Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku             String               @unique
+  name            String
+  barcode         String?
+  priceAmount     Int
+  compareAtAmount Int?
+  currency        String               @default("TRY")
+  weightGrams     Int?
+  desi            Decimal?             @db.Decimal(8, 2)
+  position        Int                  @default(0)
+  mediaId         String?
+  media           Media?               @relation(fields: [mediaId], references: [id])
+  isDefault       Boolean              @default(false)
+  disabledAt      DateTime?
+  deletedAt       DateTime?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  inventory       InventoryItem?
+  optionValues    VariantOptionValue[]
+  cartItems       CartItem[]
+  orderItems      OrderItem[]
 
   @@index([productId])
   @@map("product_variants")
@@ -292,6 +306,7 @@ model Media {
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
   productImages   ProductImage[]
+  variantImages   ProductVariant[]
   banners         Banner[]
   seoOg           SeoMetadata[]
 
@@ -393,6 +408,11 @@ model Order {
   shippingAddress Json
   billingAddress  Json
   customerNote    String?
+  staffNote       String?
+  invoiceNumber   String?
+  invoicedAt      DateTime?
+  termsAcceptedAt DateTime?
+  accessToken     String?       @unique
   isSeed          Boolean       @default(false)
   placedAt        DateTime      @default(now())
   createdAt       DateTime      @default(now())

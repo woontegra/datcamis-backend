@@ -103,12 +103,8 @@ test("sepet ve checkout sipariş anlık görüntüsü üretir", async () => {
       },
     },
   });
-  expect(checkout.statusCode).toBe(200);
-  const order = checkout.json().data;
-  expect(order.items[0].productName).toBe("Limon Çiçeği Kolonyası");
-  expect(order.payments[0].provider).toBe("unconfigured");
-  expect(order.shipments[0].provider).toBe("unconfigured");
-  expect(Number.isInteger(order.totalAmount)).toBe(true);
+  expect(checkout.statusCode).toBe(409);
+  expect(checkout.json().error.code).toBe("PAYMENT_UNAVAILABLE");
 });
 
 test("editör olmayan istek kullanıcı listesine giremez", async () => {

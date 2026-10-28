@@ -13,7 +13,11 @@ import { detectImage, safeFileName, UPLOAD_MAX_BYTES } from "../src/media/image"
 import { photoJpeg, photoPng, photoWebp, transparentPng } from "./helpers/images";
 
 loadDotEnv();
-const env = loadEnv();
+const env = loadEnv({
+  ...process.env,
+  STORAGE_PROVIDER: "local",
+  BLOB_READ_WRITE_TOKEN: "",
+});
 const storage = new LocalStorageAdapter(path.resolve(env.STORAGE_LOCAL_ROOT));
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");

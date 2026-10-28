@@ -1,4 +1,5 @@
 import type { Env } from "../config/env";
+import { isPaytrConfigured } from "./paytr";
 
 export type ProviderResult = {
   provider: string;
@@ -47,7 +48,19 @@ export class UnconfiguredShippingProvider implements ShippingProvider {
   }
 }
 
+export class PaytrPaymentProvider implements PaymentProvider {
+  createPayment(): ProviderResult {
+    return {
+      provider: "paytr",
+      status: "PENDING",
+      providerRef: null,
+      metadata: { iframe: true },
+    };
+  }
+}
+
 export function createPaymentProvider(env: Env): PaymentProvider {
+  if (isPaytrConfigured(env)) return new PaytrPaymentProvider();
   if (env.PAYMENT_PROVIDER !== "unconfigured") {
     return new UnconfiguredPaymentProvider(env.PAYMENT_PROVIDER);
   }

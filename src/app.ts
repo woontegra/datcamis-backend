@@ -5,6 +5,7 @@ import multipart from "@fastify/multipart";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
 import path from "path";
+import { parse as parseQuery } from "querystring";
 import { AppError } from "./common/errors";
 import type { Env } from "./config/env";
 import { registerRoutes } from "./routes/register";
@@ -16,13 +17,35 @@ export async function buildApp(env: Env) {
   const app = Fastify({
     logger: {
       level: env.LOG_LEVEL,
-      redact: ["req.headers.authorization", "req.headers.cookie", "req.body.password"],
+      redact: [
+        "req.headers.authorization",
+        "req.headers.cookie",
+        "req.body.password",
+        "req.body.invoice.nationalId",
+        "req.body.invoice.taxId",
+        "req.body.iban",
+      ],
+      serializers: {
+        req(request) {
+          const raw = request.url || "";
+          const url = raw.includes("/checkout/thanks/") ? "/api/v1/checkout/thanks/[redacted]" : raw;
+          return { method: request.method, url, host: request.host, remoteAddress: request.ip };
+        },
+      },
     },
     trustProxy: env.NODE_ENV === "production",
   });
 
   // Local storage stays available for reading older local media even when new uploads go to Vercel Blob.
   const storage = new MediaStorage(env, new LocalStorageAdapter(path.resolve(env.STORAGE_LOCAL_ROOT)), new BlobStorage(env.BLOB_READ_WRITE_TOKEN));
+
+  app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_request, body, done) => {
+    try {
+      done(null, parseQuery(typeof body === "string" ? body : body.toString("utf8")));
+    } catch (error) {
+      done(error as Error, undefined);
+    }
+  });
 
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(cors, { origin: env.corsOrigins, credentials: true });

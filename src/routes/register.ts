@@ -7,15 +7,20 @@ import { parse } from "../common/parse";
 import { randomToken, sha256, verifyPassword } from "../common/password";
 import { signAccessToken } from "../common/tokens";
 import type { Env } from "../config/env";
+import { registerProductAdminRoutes } from "../catalog/admin";
 import { publicProductInclude, serializeProduct } from "../catalog/serialize";
 import { prisma } from "../db";
 import { editorImageMimeTypes, editorMediaIds, pageDocumentSchema, type PageDocument } from "../page-builder/schema";
-import { createPaymentProvider, createShippingProvider } from "../providers/commerce";
+import { checkoutPaymentOptions, clientIp, checkoutBodySchema, placeHavaleCheckout, placePaytrCheckout } from "../orders/checkout";
+import { loadThanksByAccessKey } from "../orders/thanks";
+import { readHavaleSettings, saveHavaleSettings } from "../orders/havale";
+import { registerPaytrCallback } from "../payments/paytr-callback";
 import { assertSafeKey } from "../storage/adapter";
 import type { MediaStorage } from "../storage/media-storage";
 import { storageStatus } from "../storage/persistence";
 import { cleanOriginalName, detectImage, matchesDeclared, safeFileName, UPLOAD_IMAGE_TYPES, UPLOAD_MAX_BYTES } from "../media/image";
 import { imageUsage, optimizeImage } from "../media/optimize";
+import { registerOrderAdminRoutes } from "../orders/admin";
 import { randomBytes } from "crypto";
 
 const listQuery = z.object({
@@ -25,17 +30,6 @@ const listQuery = z.object({
   category: z.string().trim().max(80).optional(),
   collection: z.string().trim().max(80).optional(),
   sort: z.enum(["newest", "name", "price_asc", "price_desc"]).default("newest"),
-});
-
-const addressSchema = z.object({
-  fullName: z.string().trim().min(3).max(120),
-  phone: z.string().trim().min(10).max(20),
-  line1: z.string().trim().min(3).max(200),
-  line2: z.string().trim().max(200).optional(),
-  district: z.string().trim().min(2).max(80),
-  city: z.string().trim().min(2).max(80),
-  postalCode: z.string().trim().min(4).max(10),
-  country: z.string().trim().length(2).default("TR"),
 });
 
 function cartExpiry() {
@@ -49,7 +43,13 @@ async function findCart(token: string | undefined) {
     include: {
       items: {
         include: {
-          variant: { include: { product: true, inventory: true } },
+          variant: {
+            include: {
+              inventory: true,
+              media: true,
+              product: { include: { images: { orderBy: { sortOrder: "asc" as const }, take: 1, include: { media: true } } } },
+            },
+          },
         },
       },
     },
@@ -58,20 +58,33 @@ async function findCart(token: string | undefined) {
   return cart;
 }
 
+function cartItemImage(item: Awaited<ReturnType<typeof findCart>>["items"][number]) {
+  const media = item.variant.media && !item.variant.media.deletedAt
+    ? item.variant.media
+    : item.variant.product.images[0]?.media;
+  if (!media || media.deletedAt) return null;
+  return { url: `/api/v1/media/${media.id}/file`, alt: media.alt || item.variant.product.name };
+}
+
 function serializeCart(cart: Awaited<ReturnType<typeof findCart>>) {
-  const items = cart.items.map((item) => ({
-    id: item.id,
-    quantity: item.quantity,
-    unitAmount: item.unitAmount,
-    lineAmount: item.unitAmount * item.quantity,
-    currency: item.variant.currency,
-    variantId: item.variantId,
-    variantName: item.variant.name,
-    sku: item.variant.sku,
-    productName: item.variant.product.name,
-    productSlug: item.variant.product.slug,
-    isSeed: item.variant.product.isSeed,
-  }));
+  const items = cart.items.map((item) => {
+    const available = (item.variant.inventory?.onHand ?? 0) - (item.variant.inventory?.reserved ?? 0);
+    return {
+      id: item.id,
+      quantity: item.quantity,
+      unitAmount: item.unitAmount,
+      lineAmount: item.unitAmount * item.quantity,
+      currency: item.variant.currency,
+      variantId: item.variantId,
+      variantName: item.variant.name,
+      sku: item.variant.sku,
+      productName: item.variant.product.name,
+      productSlug: item.variant.product.slug,
+      isSeed: item.variant.product.isSeed,
+      available,
+      image: cartItemImage(item),
+    };
+  });
   return {
     id: cart.id,
     currency: cart.currency,
@@ -328,102 +341,25 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     return { data: serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
   });
 
+  app.get("/api/v1/checkout/payment-config", async () => ({ data: await checkoutPaymentOptions(env) }));
+
+  app.get("/api/v1/checkout/thanks/:accessKey", {
+    config: { rateLimit: { max: 40, timeWindow: "1 minute" } },
+  }, async (request) => {
+    const { accessKey } = parse(z.object({ accessKey: z.string().trim().min(1).max(80) }), request.params);
+    return { data: await loadThanksByAccessKey(accessKey) };
+  });
+
+  registerPaytrCallback(app, env);
+
   app.post("/api/v1/checkout", async (request) => {
     const token = request.headers["x-cart-token"];
-    const body = parse(
-      z.object({
-        email: z.string().trim().email(),
-        shippingAddress: addressSchema,
-        billingAddress: addressSchema.optional(),
-        customerNote: z.string().trim().max(500).optional(),
-      }),
-      request.body,
-    );
+    const body = parse(checkoutBodySchema, request.body);
     const cart = await findCart(typeof token === "string" ? token : undefined);
-    if (cart.items.length === 0) throw new AppError(400, "CART_EMPTY", "Sepet boş.");
-
-    const payment = createPaymentProvider(env).createPayment({
-      orderNumber: "pending",
-      amount: cart.items.reduce((sum, item) => sum + item.unitAmount * item.quantity, 0),
-      currency: cart.currency,
-    });
-    const shipment = createShippingProvider(env).createShipment({ orderNumber: "pending" });
-    const subtotal = cart.items.reduce((sum, item) => sum + item.unitAmount * item.quantity, 0);
-
-    const order = await prisma.$transaction(async (tx) => {
-      const sequence = await tx.$queryRaw<Array<{ last: number }>>`
-        UPDATE "order_sequences" SET "last" = "last" + 1 WHERE "id" = 1 RETURNING "last"
-      `;
-      const last = sequence[0]?.last;
-      if (!last) throw new AppError(500, "SEQUENCE_MISSING", "Sipariş sırası hazır değil.");
-      const number = `DM-${last}`;
-      for (const item of cart.items) {
-        const updated = await tx.$executeRaw`
-          UPDATE "inventory_items"
-          SET "onHand" = "onHand" - ${item.quantity}, "updatedAt" = NOW()
-          WHERE "variantId" = ${item.variantId} AND ("onHand" - "reserved") >= ${item.quantity}
-        `;
-        if (Number(updated) !== 1) throw new AppError(409, "INSUFFICIENT_STOCK", "Stok bu sipariş için yetersiz.");
-        const inventory = await tx.inventoryItem.findUniqueOrThrow({ where: { variantId: item.variantId } });
-        await tx.stockMovement.create({
-          data: {
-            inventoryItemId: inventory.id,
-            type: "OUT",
-            quantity: item.quantity,
-            reason: "checkout",
-            referenceType: "order",
-          },
-        });
-      }
-      const created = await tx.order.create({
-        data: {
-          number,
-          email: body.email,
-          status: "PENDING",
-          currency: cart.currency,
-          subtotalAmount: subtotal,
-          discountAmount: 0,
-          shippingAmount: 0,
-          taxAmount: 0,
-          totalAmount: subtotal,
-          shippingAddress: body.shippingAddress,
-          billingAddress: body.billingAddress ?? body.shippingAddress,
-          customerNote: body.customerNote,
-          items: {
-            create: cart.items.map((item) => ({
-              variantId: item.variantId,
-              productName: item.variant.product.name,
-              variantName: item.variant.name,
-              sku: item.variant.sku,
-              quantity: item.quantity,
-              unitAmount: item.unitAmount,
-              totalAmount: item.unitAmount * item.quantity,
-            })),
-          },
-          payments: {
-            create: {
-              provider: payment.provider,
-              status: payment.status,
-              amount: subtotal,
-              currency: cart.currency,
-              metadata: payment.metadata as Prisma.InputJsonValue,
-            },
-          },
-          shipments: {
-            create: {
-              provider: shipment.provider,
-              status: shipment.status,
-              metadata: shipment.metadata as Prisma.InputJsonValue,
-            },
-          },
-        },
-        include: { items: true, payments: true, shipments: true },
-      });
-      await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
-      return created;
-    });
-
-    return { data: order };
+    const data = body.paymentMethod === "havale"
+      ? await placeHavaleCheckout({ env, cart, body })
+      : await placePaytrCheckout({ env, cart, body, userIp: clientIp(request) });
+    return { data };
   });
 
   app.post("/api/v1/newsletter", async (request) => {
@@ -436,7 +372,14 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     return { data: { subscribed: true } };
   });
 
-  app.post("/api/v1/admin/auth/login", { config: { rateLimit: { max: 8, timeWindow: "15 minutes" } } }, async (request, reply) => {
+  app.post("/api/v1/admin/auth/login", {
+    config: {
+      rateLimit:
+        env.NODE_ENV === "production"
+          ? { max: 8, timeWindow: "15 minutes" }
+          : { max: 60, timeWindow: "1 minute" },
+    },
+  }, async (request, reply) => {
     const body = parse(z.object({ email: z.string().trim().email(), password: z.string().min(8).max(200) }), request.body);
     const user = await prisma.user.findFirst({ where: { email: body.email.toLowerCase(), deletedAt: null } });
     if (!user || user.status !== "ACTIVE" || !(await verifyPassword(user.passwordHash, body.password))) {
@@ -576,15 +519,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     };
   });
 
-  app.get("/api/v1/admin/products", async (request) => {
-    await requireStaff(request, env, ["OWNER", "ADMIN", "EDITOR", "ORDER_STAFF"]);
-    const rows = await prisma.product.findMany({
-      where: { deletedAt: null },
-      include: publicProductInclude,
-      orderBy: { name: "asc" },
-    });
-    return { data: rows.map((row) => serializeProduct(row, true)) };
-  });
+  registerProductAdminRoutes(app, env);
 
   app.get("/api/v1/admin/categories", async (request) => {
     await requireStaff(request, env);
@@ -598,16 +533,32 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     return { data: rows };
   });
 
-  app.get("/api/v1/admin/orders", async (request) => {
-    await requireStaff(request, env, ["OWNER", "ADMIN", "ORDER_STAFF"]);
-    const rows = await prisma.order.findMany({ orderBy: { placedAt: "desc" }, take: 50, include: { payments: true, shipments: true } });
-    return { data: rows };
-  });
+  registerOrderAdminRoutes(app, env);
 
   app.get("/api/v1/admin/customers", async (request) => {
     await requireStaff(request, env, ["OWNER", "ADMIN", "ORDER_STAFF"]);
     const rows = await prisma.customer.findMany({ where: { deletedAt: null }, orderBy: { createdAt: "desc" } });
     return { data: rows.map((row) => ({ id: row.id, email: row.email, firstName: row.firstName, lastName: row.lastName, phone: row.phone, createdAt: row.createdAt })) };
+  });
+
+  app.get("/api/v1/admin/settings/havale", async (request) => {
+    await requireStaff(request, env, ["OWNER", "ADMIN"]);
+    return { data: await readHavaleSettings() };
+  });
+
+  app.put("/api/v1/admin/settings/havale", async (request) => {
+    const staff = await requireStaff(request, env, ["OWNER", "ADMIN"]);
+    const data = await saveHavaleSettings(request.body);
+    await prisma.auditLog.create({
+      data: {
+        actorId: staff.id,
+        action: "settings.havale",
+        entityType: "setting",
+        entityId: "havale",
+        metadata: { text: data.enabled ? "Havale / EFT ayarları güncellendi." : "Havale / EFT kapatıldı.", enabled: data.enabled, bankName: data.bankName },
+      },
+    });
+    return { data };
   });
 
   app.get("/api/v1/admin/users", async (request) => {

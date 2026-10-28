@@ -29,6 +29,17 @@ const schema = z.object({
   S3_SECRET_ACCESS_KEY: z.string().optional(),
   PAYMENT_PROVIDER: z.string().default("unconfigured"),
   SHIPPING_PROVIDER: z.string().default("unconfigured"),
+  PAYTR_MERCHANT_ID: z.string().optional().transform((value) => value?.trim() || undefined),
+  PAYTR_MERCHANT_KEY: z.string().optional().transform((value) => value?.trim() || undefined),
+  PAYTR_MERCHANT_SALT: z.string().optional().transform((value) => value?.trim() || undefined),
+  PAYTR_TEST_MODE: z
+    .string()
+    .optional()
+    .transform((value) => {
+      const trimmed = value?.trim();
+      if (trimmed === "0" || trimmed === "1") return trimmed;
+      return undefined;
+    }),
 });
 
 export type Env = z.infer<typeof schema> & { corsOrigins: string[] };
