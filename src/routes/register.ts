@@ -21,6 +21,8 @@ import { storageStatus } from "../storage/persistence";
 import { cleanOriginalName, detectImage, matchesDeclared, safeFileName, UPLOAD_IMAGE_TYPES, UPLOAD_MAX_BYTES } from "../media/image";
 import { imageUsage, optimizeImage } from "../media/optimize";
 import { registerOrderAdminRoutes } from "../orders/admin";
+import { optionalCustomer } from "../auth/customer";
+import { registerCustomerRoutes, saveCheckoutAddress } from "../customers/routes";
 import { randomBytes } from "crypto";
 
 const listQuery = z.object({
@@ -352,13 +354,19 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
 
   registerPaytrCallback(app, env);
 
+  registerCustomerRoutes(app, env);
+
   app.post("/api/v1/checkout", async (request) => {
     const token = request.headers["x-cart-token"];
-    const body = parse(checkoutBodySchema, request.body);
+    const parsed = parse(checkoutBodySchema, request.body);
+    const customer = await optionalCustomer(request);
+    const body = customer ? { ...parsed, email: customer.email } : parsed;
     const cart = await findCart(typeof token === "string" ? token : undefined);
+    const customerId = customer?.id ?? null;
     const data = body.paymentMethod === "havale"
-      ? await placeHavaleCheckout({ env, cart, body })
-      : await placePaytrCheckout({ env, cart, body, userIp: clientIp(request) });
+      ? await placeHavaleCheckout({ env, cart, body, customerId })
+      : await placePaytrCheckout({ env, cart, body, userIp: clientIp(request), customerId });
+    if (customer && body.saveAddress) await saveCheckoutAddress(customer.id, body.shippingAddress);
     return { data };
   });
 

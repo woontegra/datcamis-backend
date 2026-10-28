@@ -118,14 +118,34 @@ model Customer {
   lastName        String
   phone           String?
   emailVerifiedAt DateTime?
+  privacyNoticeAcceptedAt DateTime?
+  marketingConsentAt      DateTime?
+  failedLoginCount        Int       @default(0)
+  loginLockedUntil        DateTime?
   deletedAt       DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   addresses       Address[]
   carts           Cart[]
   orders          Order[]
+  sessions        CustomerSession[]
 
   @@map("customers")
+}
+
+model CustomerSession {
+  id         String    @id @default(cuid())
+  customerId String
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  userAgent  String?
+  ip         String?
+  createdAt  DateTime  @default(now())
+
+  @@index([customerId])
+  @@map("customer_sessions")
 }
 
 model Address {

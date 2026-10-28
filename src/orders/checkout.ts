@@ -22,7 +22,7 @@ import { captureStockOnce, HAVALE_STOCK_REASON } from "./stock";
 import { newOrderAccessToken } from "./thanks";
 import { TURKEY_DISTRICTS, isTurkeyCityDistrict } from "./turkey-locations";
 
-const addressSchema = z.object({
+export const addressSchema = z.object({
   fullName: z.string().trim().min(3, "Ad soyad en az 3 karakter olmalı.").max(120, "Ad soyad çok uzun."),
   phone: z.string().trim().min(10, "Telefon numarasını kontrol edin.").max(20, "Telefon numarasını kontrol edin."),
   line1: z.string().trim().min(3, "Adres en az 3 karakter olmalı.").max(200, "Adres çok uzun."),
@@ -52,6 +52,7 @@ export const checkoutBodySchema = z.object({
   customerNote: z.string().trim().max(500).optional(),
   paymentMethod: z.enum(["paytr", "havale"], { errorMap: () => ({ message: "Ödeme yöntemi seçin." }) }),
   termsAccepted: z.literal(true, { errorMap: () => ({ message: "Sözleşmeleri onaylamanız gerekir." }) }),
+  saveAddress: z.boolean().optional(),
 }).superRefine((value, ctx) => {
   const nationalId = value.invoice.nationalId?.trim() ?? "";
   if (nationalId && !isValidTckn(nationalId)) {
@@ -159,6 +160,7 @@ export async function placePaytrCheckout(options: {
   body: z.infer<typeof checkoutBodySchema>;
   userIp: string;
   fetchToken?: TokenFetcher;
+  customerId?: string | null;
 }) {
   const credentials = paytrCredentialsFromEnv(options.env);
   if (!credentials) {
@@ -193,6 +195,7 @@ export async function placePaytrCheckout(options: {
     const created = await tx.order.create({
       data: {
         number,
+        customerId: options.customerId ?? null,
         email: options.body.email,
         status: "PENDING",
         currency: options.cart.currency,
@@ -285,6 +288,7 @@ export async function placeHavaleCheckout(options: {
   env: Env;
   cart: Cart;
   body: z.infer<typeof checkoutBodySchema>;
+  customerId?: string | null;
 }) {
   const settings = await readHavaleSettings();
   if (!isHavaleReady(settings)) {
@@ -317,6 +321,7 @@ export async function placeHavaleCheckout(options: {
     const created = await tx.order.create({
       data: {
         number: `DM-${last}`,
+        customerId: options.customerId ?? null,
         email: options.body.email,
         status: "PENDING",
         currency: options.cart.currency,

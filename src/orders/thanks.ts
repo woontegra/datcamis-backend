@@ -54,7 +54,7 @@ function itemImage(item: {
   return { url: `/api/v1/media/${media.id}/file`, alt: media.alt || item.productName };
 }
 
-function bankFromMeta(value: Prisma.JsonValue | null) {
+export function bankFromMeta(value: Prisma.JsonValue | null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return { bankName: "", accountHolder: "", iban: "" };
   }
