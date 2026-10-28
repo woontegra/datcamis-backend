@@ -68,6 +68,7 @@ test("editör fiyat ve stok değiştiremez, personel yalnızca görür", async (
     headers: { authorization: ownerHeader, "content-type": "application/json" },
     payload: {
       name: `TEST Kolonya ${stamp}`,
+      vatRate: 20,
       summary: "Test",
       description: "Test açıklama",
       categoryIds: [ids.category],
@@ -105,6 +106,7 @@ test("SKU ve slug benzersizdir, indirim öncesi fiyat satıştan yüksek olmalı
     headers: { authorization: ownerHeader, "content-type": "application/json" },
     payload: {
       name: `TEST Slug ${stamp}`,
+      vatRate: 20,
       slug: `test-slug-${stamp}`,
       variants: [variant(`TEST-UNIQ-${stamp}`, 4000, 6000)],
     },
@@ -118,6 +120,7 @@ test("SKU ve slug benzersizdir, indirim öncesi fiyat satıştan yüksek olmalı
     headers: { authorization: ownerHeader, "content-type": "application/json" },
     payload: {
       name: `TEST Slug iki ${stamp}`,
+      vatRate: 20,
       slug: `test-slug-${stamp}`,
       variants: [variant(`TEST-UNIQ-B-${stamp}`, 4000, 6000)],
     },
@@ -132,11 +135,41 @@ test("SKU ve slug benzersizdir, indirim öncesi fiyat satıştan yüksek olmalı
     headers: { authorization: ownerHeader, "content-type": "application/json" },
     payload: {
       name: `TEST Fiyat ${stamp}`,
+      vatRate: 20,
       variants: [variant(`TEST-BADP-${stamp}`, 5000, 5000)],
     },
   });
   expect(badPrice.statusCode).toBe(400);
   expect(badPrice.json().error.code).toBe("COMPARE_AT_INVALID");
+});
+
+test("KDV oranı zorunludur ve yalnızca %1, %10 veya %20 olabilir", async () => {
+  const create = (vatRate: unknown, sku: string) =>
+    app.inject({
+      method: "POST",
+      url: "/api/v1/admin/products",
+      headers: { authorization: ownerHeader, "content-type": "application/json" },
+      payload: { name: `TEST KDV ${sku}`, ...(vatRate === undefined ? {} : { vatRate }), variants: [variant(`TEST-KDV-${sku}-${stamp}`)] },
+    });
+  for (const [vatRate, sku] of [[undefined, "YOK"], [null, "BOS"], [18, "ON8"], [0, "SIF"]] as const) {
+    const response = await create(vatRate, sku);
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toMatchObject({ code: "VAT_RATE_REQUIRED", message: "KDV oranı seçin: %1, %10 veya %20." });
+  }
+  const ok = await create(1, "BIR");
+  expect(ok.statusCode).toBe(200);
+  expect(ok.json().data.vatRate).toBe(1);
+  ids.products.push(ok.json().data.id);
+
+  const clear = await app.inject({
+    method: "PATCH",
+    url: `/api/v1/admin/products/${ok.json().data.id}`,
+    headers: { authorization: ownerHeader, "content-type": "application/json" },
+    payload: { name: ok.json().data.name, vatRate: null },
+  });
+  expect(clear.statusCode).toBe(400);
+  expect(clear.json().error.code).toBe("VAT_RATE_REQUIRED");
+  expect((await prisma.product.findUniqueOrThrow({ where: { id: ok.json().data.id } })).vatRate).toBe(1);
 });
 
 test("stok hareketi kaydedilir, kopya taslak ve stoksuz olur, siparişli ürün silinemez", async () => {
@@ -146,6 +179,7 @@ test("stok hareketi kaydedilir, kopya taslak ve stoksuz olur, siparişli ürün 
     headers: { authorization: ownerHeader, "content-type": "application/json" },
     payload: {
       name: `TEST Stok ${stamp}`,
+      vatRate: 10,
       variants: [variant(`TEST-STK-${stamp}`, 3000, 4500)],
     },
   });

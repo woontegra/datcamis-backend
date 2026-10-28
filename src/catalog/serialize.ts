@@ -13,6 +13,10 @@ const productInclude = {
   },
   categories: { include: { category: true } },
   collections: { include: { collection: true } },
+  options: {
+    orderBy: { position: "asc" as const },
+    include: { attribute: true, values: { orderBy: { position: "asc" as const }, include: { attributeValue: true } } },
+  },
 } satisfies Prisma.ProductInclude;
 
 export const publicProductInclude = productInclude;
@@ -46,10 +50,15 @@ export function serializeVariant(variant: ProductRecord["variants"][number], adm
     isDefault: variant.isDefault,
     inStock: available > 0,
     disabled: Boolean(variant.disabledAt),
-    options: variant.optionValues.map((item) => ({
-      name: item.value.option.name,
-      value: item.value.value,
-    })),
+    options: variant.optionValues
+      .slice()
+      .sort((a, b) => a.value.option.position - b.value.option.position)
+      .map((item) => ({
+        optionId: item.value.optionId,
+        valueId: item.value.id,
+        name: item.value.option.name,
+        value: item.value.value,
+      })),
     image: variant.media && !variant.media.deletedAt
       ? { id: variant.media.id, alt: variant.media.alt || variant.name, url: mediaUrl(variant.media.id) }
       : null,
@@ -62,6 +71,7 @@ export function serializeVariant(variant: ProductRecord["variants"][number], adm
           onHand: variant.inventory?.onHand ?? 0,
           reserved: variant.inventory?.reserved ?? 0,
           lowThreshold: variant.inventory?.lowThreshold ?? 0,
+          optionValueIds: variant.optionValues.map((item) => item.value.attributeValueId).filter((id): id is string => Boolean(id)),
         }
       : {}),
   };
@@ -93,11 +103,23 @@ export function serializeProduct(product: ProductRecord, admin = false) {
         sortOrder: image.sortOrder,
       })),
     variants: variants.map((variant) => serializeVariant(variant, admin)),
+    options: product.options.map((option) => ({
+      id: option.id,
+      attributeId: option.attributeId,
+      name: option.name,
+      displayType: option.attribute?.displayType ?? "BUTTONS",
+      values: option.values.map((value) => ({
+        id: value.id,
+        attributeValueId: value.attributeValueId,
+        name: value.value,
+        colorHex: value.attributeValue?.colorHex ?? null,
+      })),
+    })),
     categories: product.categories
-      .filter((item) => !item.category.deletedAt)
+      .filter((item) => !item.category.deletedAt && (admin || item.category.isVisible))
       .map((item) => ({ id: item.category.id, slug: item.category.slug, name: item.category.name })),
     collections: product.collections
-      .filter((item) => !item.collection.deletedAt)
+      .filter((item) => !item.collection.deletedAt && (admin || item.collection.isVisible))
       .map((item) => ({ id: item.collection.id, slug: item.collection.slug, name: item.collection.name })),
   };
 }

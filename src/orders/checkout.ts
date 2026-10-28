@@ -16,6 +16,8 @@ import {
   siteOrigin,
   type TokenFetcher,
 } from "../providers/paytr";
+import { minOrderMessage, orderTotals, readPricingSettings } from "../settings/pricing";
+import { readSection } from "../settings/store-settings";
 import { havaleSnapshot, isHavaleReady, readHavaleSettings } from "./havale";
 import { isValidTaxNumber, isValidTckn } from "./invoice";
 import { captureStockOnce, HAVALE_STOCK_REASON } from "./stock";
@@ -121,11 +123,53 @@ type Cart = {
       name: string;
       sku: string;
       priceAmount: number;
-      product: { name: string };
+      product: { name: string; vatRate?: number | null };
       inventory: { onHand: number; reserved: number } | null;
     };
   }>;
 };
+
+async function priceCart(cart: Cart) {
+  if (cart.items.length === 0) throw new AppError(400, "CART_EMPTY", "Sepet boş.");
+  const priced = cart.items.map((item) => {
+    const unitAmount = item.variant.priceAmount;
+    return {
+      ...item,
+      unitAmount,
+      lineAmount: unitAmount * item.quantity,
+      vatRate: item.variant.product.vatRate ?? null,
+      available: (item.variant.inventory?.onHand ?? 0) - (item.variant.inventory?.reserved ?? 0),
+    };
+  });
+  for (const item of priced) {
+    if (item.available < item.quantity) throw new AppError(409, "INSUFFICIENT_STOCK", "İstenen adet stokta yok.");
+  }
+  const [pricing, orderSettings] = await Promise.all([readPricingSettings(), readSection("order")]);
+  const totals = orderTotals(priced, pricing);
+  if (totals.minOrderShortfall > 0 && totals.minOrderAmount) {
+    throw new AppError(400, "MIN_ORDER_AMOUNT", minOrderMessage(totals.minOrderAmount, totals.minOrderShortfall));
+  }
+  return { priced, totals, orderSettings };
+}
+
+async function nextOrderNumber(tx: Prisma.TransactionClient, prefix: string) {
+  const sequence = await tx.$queryRaw<Array<{ last: number }>>`
+    UPDATE "order_sequences" SET "last" = "last" + 1 WHERE "id" = 1 RETURNING "last"
+  `;
+  const last = sequence[0]?.last;
+  if (!last) throw new AppError(500, "SEQUENCE_MISSING", "Sipariş sırası hazır değil.");
+  return { last, number: `${prefix}${last}` };
+}
+
+function orderAmounts(totals: Awaited<ReturnType<typeof priceCart>>["totals"]) {
+  return {
+    subtotalAmount: totals.subtotalAmount,
+    discountAmount: totals.discountAmount,
+    shippingAmount: totals.shippingAmount,
+    taxAmount: totals.taxAmount,
+    totalAmount: totals.totalAmount,
+  };
+}
 
 export const CHECKOUT_NONE_MESSAGE = "Şu an tamamlanabilir bir ödeme yöntemi yok.";
 
@@ -166,31 +210,12 @@ export async function placePaytrCheckout(options: {
   if (!credentials) {
     throw new AppError(409, "PAYMENT_UNAVAILABLE", "Online ödeme yakında aktif olacak.");
   }
-  if (options.cart.items.length === 0) throw new AppError(400, "CART_EMPTY", "Sepet boş.");
-
-  const priced = options.cart.items.map((item) => {
-    const unitAmount = item.variant.priceAmount;
-    return {
-      ...item,
-      unitAmount,
-      lineAmount: unitAmount * item.quantity,
-      available: (item.variant.inventory?.onHand ?? 0) - (item.variant.inventory?.reserved ?? 0),
-    };
-  });
-  for (const item of priced) {
-    if (item.available < item.quantity) throw new AppError(409, "INSUFFICIENT_STOCK", "İstenen adet stokta yok.");
-  }
-  const subtotal = priced.reduce((sum, item) => sum + item.lineAmount, 0);
+  const { priced, totals, orderSettings } = await priceCart(options.cart);
   const shipment = createShippingProvider(options.env).createShipment({ orderNumber: "pending" });
   const origin = siteOrigin(options.env);
 
   const order = await prisma.$transaction(async (tx) => {
-    const sequence = await tx.$queryRaw<Array<{ last: number }>>`
-      UPDATE "order_sequences" SET "last" = "last" + 1 WHERE "id" = 1 RETURNING "last"
-    `;
-    const last = sequence[0]?.last;
-    if (!last) throw new AppError(500, "SEQUENCE_MISSING", "Sipariş sırası hazır değil.");
-    const number = `DM-${last}`;
+    const { last, number } = await nextOrderNumber(tx, orderSettings.numberPrefix);
     const merchantOid = merchantOidFromSequence(last, randomBytes(6).toString("hex"));
     const created = await tx.order.create({
       data: {
@@ -199,11 +224,7 @@ export async function placePaytrCheckout(options: {
         email: options.body.email,
         status: "PENDING",
         currency: options.cart.currency,
-        subtotalAmount: subtotal,
-        discountAmount: 0,
-        shippingAmount: 0,
-        taxAmount: 0,
-        totalAmount: subtotal,
+        ...orderAmounts(totals),
         shippingAddress: options.body.shippingAddress,
         billingAddress: billingSnapshot(options.body),
         customerNote: options.body.customerNote,
@@ -224,7 +245,7 @@ export async function placePaytrCheckout(options: {
           create: {
             provider: "paytr",
             status: "PENDING",
-            amount: subtotal,
+            amount: totals.totalAmount,
             currency: options.cart.currency,
             providerRef: merchantOid,
             metadata: { testMode: credentials.testMode },
@@ -259,7 +280,10 @@ export async function placePaytrCheckout(options: {
         userPhone: shipping.phone,
         merchantOkUrl: `${origin}/odeme/basarili`,
         merchantFailUrl: `${origin}/odeme/basarisiz`,
-        basket: order.items.map((item) => ({ name: `${item.productName} ${item.variantName}`.trim(), unitPrice: item.unitAmount, quantity: item.quantity })),
+        basket: [
+          ...order.items.map((item) => ({ name: `${item.productName} ${item.variantName}`.trim(), unitPrice: item.unitAmount, quantity: item.quantity })),
+          ...(order.shippingAmount > 0 ? [{ name: "Kargo", unitPrice: order.shippingAmount, quantity: 1 }] : []),
+        ],
         noInstallment: "1",
         maxInstallment: "0",
         currency: "TL",
@@ -294,42 +318,20 @@ export async function placeHavaleCheckout(options: {
   if (!isHavaleReady(settings)) {
     throw new AppError(409, "PAYMENT_UNAVAILABLE", CHECKOUT_NONE_MESSAGE);
   }
-  if (options.cart.items.length === 0) throw new AppError(400, "CART_EMPTY", "Sepet boş.");
-
-  const priced = options.cart.items.map((item) => {
-    const unitAmount = item.variant.priceAmount;
-    return {
-      ...item,
-      unitAmount,
-      lineAmount: unitAmount * item.quantity,
-      available: (item.variant.inventory?.onHand ?? 0) - (item.variant.inventory?.reserved ?? 0),
-    };
-  });
-  for (const item of priced) {
-    if (item.available < item.quantity) throw new AppError(409, "INSUFFICIENT_STOCK", "İstenen adet stokta yok.");
-  }
-  const subtotal = priced.reduce((sum, item) => sum + item.lineAmount, 0);
+  const { priced, totals, orderSettings } = await priceCart(options.cart);
   const shipment = createShippingProvider(options.env).createShipment({ orderNumber: "pending" });
-  const bank = havaleSnapshot(settings);
+  const bank = { ...havaleSnapshot(settings), paymentDueDays: orderSettings.havalePaymentDays };
 
   const order = await prisma.$transaction(async (tx) => {
-    const sequence = await tx.$queryRaw<Array<{ last: number }>>`
-      UPDATE "order_sequences" SET "last" = "last" + 1 WHERE "id" = 1 RETURNING "last"
-    `;
-    const last = sequence[0]?.last;
-    if (!last) throw new AppError(500, "SEQUENCE_MISSING", "Sipariş sırası hazır değil.");
+    const { number } = await nextOrderNumber(tx, orderSettings.numberPrefix);
     const created = await tx.order.create({
       data: {
-        number: `DM-${last}`,
+        number,
         customerId: options.customerId ?? null,
         email: options.body.email,
         status: "PENDING",
         currency: options.cart.currency,
-        subtotalAmount: subtotal,
-        discountAmount: 0,
-        shippingAmount: 0,
-        taxAmount: 0,
-        totalAmount: subtotal,
+        ...orderAmounts(totals),
         shippingAddress: options.body.shippingAddress,
         billingAddress: billingSnapshot(options.body),
         customerNote: options.body.customerNote,
@@ -350,7 +352,7 @@ export async function placeHavaleCheckout(options: {
           create: {
             provider: "havale",
             status: "PENDING",
-            amount: subtotal,
+            amount: totals.totalAmount,
             currency: options.cart.currency,
             metadata: bank,
           },

@@ -195,27 +195,65 @@ model Product {
   @@map("products")
 }
 
+enum AttributeDisplay {
+  BUTTONS
+  SELECT
+  SWATCH
+}
+
+model VariantAttribute {
+  id          String                  @id @default(cuid())
+  name        String                  @unique
+  displayType AttributeDisplay        @default(BUTTONS)
+  position    Int                     @default(0)
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+  values      VariantAttributeValue[]
+  options     ProductOption[]
+
+  @@map("variant_attributes")
+}
+
+model VariantAttributeValue {
+  id            String               @id @default(cuid())
+  attributeId   String
+  attribute     VariantAttribute     @relation(fields: [attributeId], references: [id], onDelete: Cascade)
+  name          String
+  colorHex      String?
+  position      Int                  @default(0)
+  productValues ProductOptionValue[]
+
+  @@unique([attributeId, name])
+  @@map("variant_attribute_values")
+}
+
 model ProductOption {
-  id        String               @id @default(cuid())
-  productId String
-  product   Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
-  name      String
-  position  Int                  @default(0)
-  values    ProductOptionValue[]
+  id          String               @id @default(cuid())
+  productId   String
+  product     Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name        String
+  position    Int                  @default(0)
+  values      ProductOptionValue[]
+  attributeId String?
+  attribute   VariantAttribute?    @relation(fields: [attributeId], references: [id], onDelete: SetNull)
 
   @@unique([productId, name])
+  @@index([attributeId])
   @@map("product_options")
 }
 
 model ProductOptionValue {
-  id       String               @id @default(cuid())
-  optionId String
-  option   ProductOption        @relation(fields: [optionId], references: [id], onDelete: Cascade)
-  value    String
-  position Int                  @default(0)
-  variants VariantOptionValue[]
+  id               String                 @id @default(cuid())
+  optionId         String
+  option           ProductOption          @relation(fields: [optionId], references: [id], onDelete: Cascade)
+  value            String
+  position         Int                    @default(0)
+  variants         VariantOptionValue[]
+  attributeValueId String?
+  attributeValue   VariantAttributeValue? @relation(fields: [attributeValueId], references: [id], onDelete: SetNull)
 
   @@unique([optionId, value])
+  @@index([attributeValueId])
   @@map("product_option_values")
 }
 
@@ -267,10 +305,14 @@ model Category {
   parent      Category?         @relation("CategoryTree", fields: [parentId], references: [id])
   children    Category[]        @relation("CategoryTree")
   sortOrder   Int               @default(0)
+  imageMediaId String?
+  image       Media?            @relation("CategoryImage", fields: [imageMediaId], references: [id], onDelete: SetNull)
+  isVisible   Boolean           @default(true)
   deletedAt   DateTime?
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   products    ProductCategory[]
+  menuItems   MenuItem[]
 
   @@map("categories")
 }
@@ -291,12 +333,31 @@ model Collection {
   name        String
   description String              @default("")
   sortOrder   Int                 @default(0)
+  imageMediaId String?
+  image       Media?              @relation("CollectionImage", fields: [imageMediaId], references: [id], onDelete: SetNull)
+  isVisible   Boolean             @default(true)
+  type        CollectionType      @default(MANUAL)
+  rules       Json?
+  productSort CollectionSort      @default(MANUAL)
   deletedAt   DateTime?
   createdAt   DateTime            @default(now())
   updatedAt   DateTime            @updatedAt
   products    ProductCollection[]
+  menuItems   MenuItem[]
 
   @@map("collections")
+}
+
+enum CollectionType {
+  MANUAL
+  AUTOMATIC
+}
+
+enum CollectionSort {
+  MANUAL
+  NEWEST
+  PRICE_ASC
+  PRICE_DESC
 }
 
 model ProductCollection {
@@ -329,6 +390,8 @@ model Media {
   variantImages   ProductVariant[]
   banners         Banner[]
   seoOg           SeoMetadata[]
+  categoryImages  Category[]      @relation("CategoryImage")
+  collectionImages Collection[]   @relation("CollectionImage")
 
   @@map("media")
 }
@@ -371,8 +434,11 @@ model StockMovement {
   createdById     String?
   createdBy       User?                 @relation(fields: [createdById], references: [id])
   createdAt       DateTime              @default(now())
+  delta           Int?
+  balanceAfter    Int?
 
   @@index([inventoryItemId])
+  @@index([createdAt])
   @@map("stock_movements")
 }
 
@@ -548,6 +614,7 @@ model Page {
   createdAt           DateTime       @default(now())
   updatedAt           DateTime       @updatedAt
   revisions           PageRevision[] @relation("PageRevisions")
+  menuItems           MenuItem[]
 
   @@map("pages")
 }
@@ -584,25 +651,50 @@ model BlogPost {
   @@map("blog_posts")
 }
 
+enum MenuLocation {
+  HEADER
+  FOOTER_1
+  FOOTER_2
+  FOOTER_3
+}
+
+enum MenuItemType {
+  CATEGORY
+  COLLECTION
+  PAGE
+  CUSTOM
+}
+
 model Menu {
-  id    String     @id @default(cuid())
-  key   String     @unique
-  name  String
-  items MenuItem[]
+  id       String        @id @default(cuid())
+  key      String        @unique
+  name     String
+  location MenuLocation? @unique
+  items    MenuItem[]
 
   @@map("menus")
 }
 
 model MenuItem {
-  id        String     @id @default(cuid())
-  menuId    String
-  menu      Menu       @relation(fields: [menuId], references: [id], onDelete: Cascade)
-  parentId  String?
-  parent    MenuItem?  @relation("MenuTree", fields: [parentId], references: [id])
-  children  MenuItem[] @relation("MenuTree")
-  label     String
-  href      String
-  sortOrder Int        @default(0)
+  id           String       @id @default(cuid())
+  menuId       String
+  menu         Menu         @relation(fields: [menuId], references: [id], onDelete: Cascade)
+  parentId     String?
+  parent       MenuItem?    @relation("MenuTree", fields: [parentId], references: [id])
+  children     MenuItem[]   @relation("MenuTree")
+  label        String
+  href         String
+  sortOrder    Int          @default(0)
+  type         MenuItemType @default(CUSTOM)
+  categoryId   String?
+  category     Category?    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  collectionId String?
+  collection   Collection?  @relation(fields: [collectionId], references: [id], onDelete: SetNull)
+  pageId       String?
+  page         Page?        @relation(fields: [pageId], references: [id], onDelete: SetNull)
+  pageKey      String?
+  openInNewTab Boolean      @default(false)
+  isHidden     Boolean      @default(false)
 
   @@index([menuId, parentId])
   @@map("menu_items")

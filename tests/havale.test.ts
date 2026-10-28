@@ -1,4 +1,5 @@
 import "./helpers/local-database";
+import type { Prisma } from "@prisma/client";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { buildApp } from "../src/app";
 import { hashPassword } from "../src/common/password";
@@ -25,6 +26,7 @@ const address = {
 const env = loadEnv();
 let app: Awaited<ReturnType<typeof buildApp>>;
 let ownerHeader = "";
+let previousHavale: Prisma.InputJsonValue | null = null;
 
 async function cartWithItem() {
   const created = await app.inject({ method: "POST", url: "/api/v1/carts" });
@@ -84,6 +86,8 @@ beforeAll(async () => {
   });
   ids.users.push(user.id);
   ownerHeader = `Bearer ${await signAccessToken(env, { sub: user.id, email: user.email, role: user.role })}`;
+  const existing = await prisma.siteSetting.findUnique({ where: { key: HAVALE_SETTING_KEY } });
+  previousHavale = (existing?.value as Prisma.InputJsonValue | undefined) ?? null;
   await prisma.siteSetting.upsert({
     where: { key: HAVALE_SETTING_KEY },
     update: {
@@ -97,7 +101,11 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await prisma.siteSetting.deleteMany({ where: { key: HAVALE_SETTING_KEY } });
+  if (previousHavale === null) {
+    await prisma.siteSetting.deleteMany({ where: { key: HAVALE_SETTING_KEY } });
+  } else {
+    await prisma.siteSetting.update({ where: { key: HAVALE_SETTING_KEY }, data: { value: previousHavale } });
+  }
   if (ids.orders.length) {
     await prisma.auditLog.deleteMany({ where: { entityId: { in: ids.orders } } });
     await prisma.stockMovement.deleteMany({ where: { referenceId: { in: ids.orders } } });

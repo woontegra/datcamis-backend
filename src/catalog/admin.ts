@@ -15,11 +15,31 @@ import {
   canEditProductPrice,
   canEditProductStock,
 } from "./roles";
+import {
+  combinations,
+  comboKey,
+  comboName,
+  linkVariant,
+  MAX_PRODUCT_OPTIONS,
+  productOptionInput,
+  resolveOptions,
+  variantCombo,
+  writeProductOptions,
+} from "./attributes";
+import { applyStockChange } from "./inventory";
 import { publicProductInclude, serializeProduct } from "./serialize";
 
 const PRODUCT_STATUSES = ["DRAFT", "ACTIVE", "DISABLED", "ARCHIVED"] as const;
+export const PRODUCT_VAT_RATES = [1, 10, 20] as const;
 
-function slugify(value: string) {
+function requireVatRate(value: number | null | undefined) {
+  if (value == null || !(PRODUCT_VAT_RATES as readonly number[]).includes(value)) {
+    throw new AppError(400, "VAT_RATE_REQUIRED", "KDV oranı seçin: %1, %10 veya %20.");
+  }
+  return value;
+}
+
+export function slugify(value: string) {
   return value
     .toLocaleLowerCase("tr-TR")
     .replaceAll("ı", "i")
@@ -90,6 +110,7 @@ const variantInput = z.object({
   isDefault: z.boolean().optional(),
   disabled: z.boolean().optional(),
   lowThreshold: z.number().int().min(0).optional(),
+  optionValueIds: z.array(z.string().min(1)).max(MAX_PRODUCT_OPTIONS).optional(),
 });
 
 const productBody = z.object({
@@ -107,6 +128,7 @@ const productBody = z.object({
   collectionIds: z.array(z.string().min(1)).optional(),
   images: z.array(imageInput).optional(),
   variants: z.array(variantInput).optional(),
+  options: z.array(productOptionInput).max(MAX_PRODUCT_OPTIONS).optional(),
   seo: z
     .object({
       title: z.string().trim().max(70).optional().nullable(),
@@ -185,11 +207,12 @@ async function syncRelations(productId: string, body: z.infer<typeof productBody
     }
   }
   if (body.collectionIds) {
-    await prisma.productCollection.deleteMany({ where: { productId } });
-    if (body.collectionIds.length) {
-      await prisma.productCollection.createMany({
-        data: body.collectionIds.map((collectionId, sortOrder) => ({ productId, collectionId, sortOrder })),
-      });
+    const wanted = [...new Set(body.collectionIds)];
+    await prisma.productCollection.deleteMany({ where: { productId, collectionId: { notIn: wanted } } });
+    const kept = new Set((await prisma.productCollection.findMany({ where: { productId }, select: { collectionId: true } })).map((row) => row.collectionId));
+    for (const collectionId of wanted.filter((id) => !kept.has(id))) {
+      const last = await prisma.productCollection.aggregate({ where: { collectionId }, _max: { sortOrder: true } });
+      await prisma.productCollection.create({ data: { productId, collectionId, sortOrder: (last._max.sortOrder ?? -1) + 1 } });
     }
   }
   if (body.images) {
@@ -221,12 +244,28 @@ async function syncRelations(productId: string, body: z.infer<typeof productBody
     });
   }
   if (body.variants && canEditProductPrice(role)) {
+    const resolved = body.options ? await resolveOptions(body.options) : null;
+    const combos = body.variants.map((variant) => (resolved ? variantCombo(resolved, variant.optionValueIds) : null));
+    const comboKeys = new Set<string>();
+    for (const [index, combo] of combos.entries()) {
+      if (!resolved?.length) break;
+      if (!combo) {
+        if (!body.variants[index].id) throw new AppError(400, "VARIANT_OPTIONS_INVALID", "Yeni varyant için her seçenekten bir değer seçin.");
+        continue;
+      }
+      const key = comboKey(combo);
+      if (comboKeys.has(key)) throw new AppError(400, "VARIANT_DUPLICATE", `Aynı kombinasyon iki kez girilmiş: ${comboName(resolved, combo)}.`);
+      comboKeys.add(key);
+    }
+    const valueMap = resolved ? await writeProductOptions(prisma, productId, resolved) : null;
     const keep: string[] = [];
     for (const [index, variant] of body.variants.entries()) {
       assertCompareAt(variant.priceAmount, variant.compareAtAmount);
       const sku = await uniqueSku(variant.sku, variant.id);
+      const combo = combos[index];
+      const withoutCombo = Boolean(resolved?.length) && !combo;
       const data = {
-        name: variant.name,
+        name: combo && resolved ? comboName(resolved, combo) : variant.name,
         sku,
         barcode: variant.barcode ?? null,
         priceAmount: variant.priceAmount,
@@ -236,28 +275,59 @@ async function syncRelations(productId: string, body: z.infer<typeof productBody
         position: variant.position ?? index,
         mediaId: variant.mediaId ?? null,
         isDefault: variant.isDefault ?? index === 0,
-        disabledAt: variant.disabled ? new Date() : null,
+        disabledAt: variant.disabled || withoutCombo ? new Date() : null,
       };
+      let variantId: string;
       if (variant.id) {
         const existing = await prisma.productVariant.findFirst({ where: { id: variant.id, productId } });
         if (!existing) throw new AppError(400, "VARIANT_UNKNOWN", "Varyant bu ürüne ait değil.");
-        await prisma.productVariant.update({ where: { id: variant.id }, data });
+        await prisma.productVariant.update({ where: { id: variant.id }, data: { ...data, disabledAt: data.disabledAt && (existing.disabledAt ?? data.disabledAt) } });
         if (variant.lowThreshold != null) {
           await prisma.inventoryItem.updateMany({ where: { variantId: variant.id }, data: { lowThreshold: variant.lowThreshold } });
         }
-        keep.push(variant.id);
+        variantId = variant.id;
       } else {
         const created = await prisma.productVariant.create({
           data: { ...data, productId, inventory: { create: { onHand: 0, lowThreshold: variant.lowThreshold ?? 5 } } },
         });
+        variantId = created.id;
+      }
+      keep.push(variantId);
+      if (valueMap) await linkVariant(prisma, variantId, combo ? combo.map((value) => valueMap.get(value.id)!) : []);
+    }
+
+    if (resolved?.length && valueMap) {
+      const template: Partial<z.infer<typeof variantInput>> & { priceAmount: number } =
+        body.variants.find((_, index) => combos[index]) ?? body.variants[0] ?? { priceAmount: 0 };
+      const product = await prisma.product.findUniqueOrThrow({ where: { id: productId }, select: { slug: true } });
+      for (const combo of combinations(resolved.map((option) => option.values))) {
+        if (comboKeys.has(comboKey(combo))) continue;
+        const created = await prisma.productVariant.create({
+          data: {
+            productId,
+            name: comboName(resolved, combo),
+            sku: await uniqueSku([product.slug, ...combo.map((value) => slugify(value.name))].join("-")),
+            priceAmount: template.priceAmount,
+            compareAtAmount: template.compareAtAmount ?? null,
+            weightGrams: template.weightGrams ?? null,
+            desi: parseDesi(template.desi),
+            position: keep.length,
+            isDefault: false,
+            inventory: { create: { onHand: 0, lowThreshold: template.lowThreshold ?? 5 } },
+          },
+        });
         keep.push(created.id);
+        await linkVariant(prisma, created.id, combo.map((value) => valueMap.get(value.id)!));
       }
     }
+
     const extras = await prisma.productVariant.findMany({ where: { productId, deletedAt: null, id: { notIn: keep } } });
     for (const extra of extras) {
       const ordered = await prisma.orderItem.count({ where: { variantId: extra.id } });
-      if (ordered > 0) await prisma.productVariant.update({ where: { id: extra.id }, data: { deletedAt: new Date(), disabledAt: new Date() } });
-      else await prisma.productVariant.delete({ where: { id: extra.id } });
+      if (ordered > 0) {
+        if (!extra.disabledAt) await prisma.productVariant.update({ where: { id: extra.id }, data: { disabledAt: new Date() } });
+        await linkVariant(prisma, extra.id, []);
+      } else await prisma.productVariant.delete({ where: { id: extra.id } });
     }
   }
 }
@@ -346,6 +416,7 @@ export function registerProductAdminRoutes(app: FastifyInstance, env: Env) {
     if (!canEditProductPrice(staff.role)) throw new AppError(403, "FORBIDDEN", "Yeni ürün oluşturma yetkiniz yok.");
     const body = parse(productBody, request.body);
     if (!body.variants?.length) throw new AppError(400, "VARIANT_REQUIRED", "En az bir varyant gerekli.");
+    const vatRate = requireVatRate(body.vatRate);
     const slug = await uniqueSlug(body.slug || body.name);
     const product = await prisma.product.create({
       data: {
@@ -357,7 +428,7 @@ export function registerProductAdminRoutes(app: FastifyInstance, env: Env) {
         usageNotes: body.usageNotes,
         warningNotes: body.warningNotes,
         featured: body.featured ?? false,
-        vatRate: body.vatRate ?? null,
+        vatRate,
         status: body.status === "ARCHIVED" && !canArchiveProduct(staff.role) ? "DRAFT" : body.status ?? "DRAFT",
       },
     });
@@ -377,7 +448,7 @@ export function registerProductAdminRoutes(app: FastifyInstance, env: Env) {
     }
     const slug = body.slug ? await uniqueSlug(body.slug, id) : current.slug;
     const pricePatch = canEditProductPrice(staff.role)
-      ? { featured: body.featured ?? current.featured, vatRate: body.vatRate === undefined ? current.vatRate : body.vatRate }
+      ? { featured: body.featured ?? current.featured, vatRate: body.vatRate === undefined ? current.vatRate : requireVatRate(body.vatRate) }
       : {};
     await prisma.product.update({
       where: { id },
@@ -418,36 +489,19 @@ export function registerProductAdminRoutes(app: FastifyInstance, env: Env) {
     if (!variant?.inventory) throw notFound("Varyant bulunamadı.");
     const inventory = variant.inventory;
     await prisma.$transaction(async (tx) => {
-      if (body.action === "in") {
-        if (body.quantity < 1) throw new AppError(400, "STOCK_QTY", "Eklenecek adet 1 veya daha büyük olmalı.");
-        await tx.inventoryItem.update({ where: { id: inventory.id }, data: { onHand: { increment: body.quantity } } });
-        await tx.stockMovement.create({
-          data: { inventoryItemId: inventory.id, type: "IN", quantity: body.quantity, reason: body.reason, referenceType: "product", referenceId: id, createdById: staff.id },
+      try {
+        await applyStockChange(tx, {
+          inventoryId: inventory.id,
+          action: body.action,
+          quantity: body.quantity,
+          reason: body.reason,
+          referenceType: "product",
+          referenceId: id,
+          createdById: staff.id,
         });
-      } else if (body.action === "out") {
-        if (body.quantity < 1) throw new AppError(400, "STOCK_QTY", "Düşülecek adet 1 veya daha büyük olmalı.");
-        const updated = await tx.$executeRaw`
-          UPDATE "inventory_items" SET "onHand" = "onHand" - ${body.quantity}, "updatedAt" = NOW()
-          WHERE "id" = ${inventory.id} AND "onHand" >= ${body.quantity}
-        `;
-        if (Number(updated) !== 1) throw new AppError(409, "INSUFFICIENT_STOCK", "Stok bu düşüş için yetersiz.");
-        await tx.stockMovement.create({
-          data: { inventoryItemId: inventory.id, type: "OUT", quantity: body.quantity, reason: body.reason, referenceType: "product", referenceId: id, createdById: staff.id },
-        });
-      } else {
-        const diff = body.quantity - inventory.onHand;
-        await tx.inventoryItem.update({ where: { id: inventory.id }, data: { onHand: body.quantity } });
-        await tx.stockMovement.create({
-          data: {
-            inventoryItemId: inventory.id,
-            type: "ADJUSTMENT",
-            quantity: Math.abs(diff),
-            reason: body.reason,
-            referenceType: "product",
-            referenceId: id,
-            createdById: staff.id,
-          },
-        });
+      } catch (error) {
+        if (error instanceof AppError && error.code === "INSUFFICIENT_STOCK") throw new AppError(409, "INSUFFICIENT_STOCK", "Stok bu düşüş için yetersiz.");
+        throw error;
       }
     });
     await writeAudit(staff, "product.stock", id, `Stok ${body.action}: ${variant.sku} / ${body.quantity}. ${body.reason}`);
@@ -477,8 +531,23 @@ export function registerProductAdminRoutes(app: FastifyInstance, env: Env) {
         images: { create: source.images.map((image) => ({ mediaId: image.mediaId, alt: image.alt, sortOrder: image.sortOrder })) },
       },
     });
+    const copiedValues = new Map<string, string>();
+    for (const option of source.options) {
+      const created = await prisma.productOption.create({
+        data: {
+          productId: copy.id,
+          name: option.name,
+          position: option.position,
+          attributeId: option.attributeId,
+          values: { create: option.values.map((value) => ({ value: value.value, position: value.position, attributeValueId: value.attributeValueId })) },
+        },
+        include: { values: true },
+      });
+      for (const value of option.values) copiedValues.set(value.id, created.values.find((row) => row.value === value.value)!.id);
+    }
     for (const variant of source.variants) {
       const sku = await uniqueSku(`${variant.sku}-KOPYA`);
+      const linked = variant.optionValues.map((item) => copiedValues.get(item.valueId)).filter((id): id is string => Boolean(id));
       await prisma.productVariant.create({
         data: {
           productId: copy.id,
@@ -494,6 +563,7 @@ export function registerProductAdminRoutes(app: FastifyInstance, env: Env) {
           isDefault: variant.isDefault,
           disabledAt: variant.disabledAt,
           inventory: { create: { onHand: 0, lowThreshold: variant.inventory?.lowThreshold ?? 5 } },
+          optionValues: { create: linked.map((valueId) => ({ valueId })) },
         },
       });
     }

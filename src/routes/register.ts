@@ -8,6 +8,10 @@ import { randomToken, sha256, verifyPassword } from "../common/password";
 import { signAccessToken } from "../common/tokens";
 import type { Env } from "../config/env";
 import { registerProductAdminRoutes } from "../catalog/admin";
+import { collectionProductWhere, descendantIds, orderedProductIds, registerTaxonomyRoutes, STORE_PRODUCT_WHERE, storeSortFor, visibleCategoryIds } from "../catalog/taxonomy";
+import { registerMenuRoutes } from "../content/menus";
+import { registerInventoryRoutes } from "../catalog/inventory";
+import { registerAttributeRoutes } from "../catalog/attributes";
 import { publicProductInclude, serializeProduct } from "../catalog/serialize";
 import { prisma } from "../db";
 import { editorImageMimeTypes, editorMediaIds, pageDocumentSchema, type PageDocument } from "../page-builder/schema";
@@ -24,6 +28,8 @@ import { registerOrderAdminRoutes } from "../orders/admin";
 import { optionalCustomer } from "../auth/customer";
 import { registerCustomerRoutes, saveCheckoutAddress } from "../customers/routes";
 import { randomBytes } from "crypto";
+import { minOrderMessage, orderTotals, readPricingSettings } from "../settings/pricing";
+import { registerMaintenanceGuard, registerSettingsRoutes } from "../settings/routes";
 
 const listQuery = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -31,7 +37,7 @@ const listQuery = z.object({
   q: z.string().trim().max(120).optional(),
   category: z.string().trim().max(80).optional(),
   collection: z.string().trim().max(80).optional(),
-  sort: z.enum(["newest", "name", "price_asc", "price_desc"]).default("newest"),
+  sort: z.enum(["newest", "name", "price_asc", "price_desc"]).optional(),
 });
 
 function cartExpiry() {
@@ -68,7 +74,7 @@ function cartItemImage(item: Awaited<ReturnType<typeof findCart>>["items"][numbe
   return { url: `/api/v1/media/${media.id}/file`, alt: media.alt || item.variant.product.name };
 }
 
-function serializeCart(cart: Awaited<ReturnType<typeof findCart>>) {
+async function serializeCart(cart: Awaited<ReturnType<typeof findCart>>) {
   const items = cart.items.map((item) => {
     const available = (item.variant.inventory?.onHand ?? 0) - (item.variant.inventory?.reserved ?? 0);
     return {
@@ -87,11 +93,25 @@ function serializeCart(cart: Awaited<ReturnType<typeof findCart>>) {
       image: cartItemImage(item),
     };
   });
+  const totals = orderTotals(
+    cart.items.map((item) => ({ lineAmount: item.unitAmount * item.quantity, vatRate: item.variant.product.vatRate })),
+    await readPricingSettings(),
+  );
   return {
     id: cart.id,
     currency: cart.currency,
     items,
-    subtotalAmount: items.reduce((sum, item) => sum + item.lineAmount, 0),
+    subtotalAmount: totals.subtotalAmount,
+    discountAmount: totals.discountAmount,
+    shippingAmount: totals.shippingAmount,
+    totalAmount: totals.totalAmount,
+    freeShippingThreshold: totals.freeShippingThreshold,
+    freeShippingRemaining: totals.freeShippingRemaining,
+    minOrderAmount: totals.minOrderAmount,
+    minOrderShortfall: totals.minOrderShortfall,
+    minOrderMessage: totals.minOrderShortfall > 0 && totals.minOrderAmount
+      ? minOrderMessage(totals.minOrderAmount, totals.minOrderShortfall)
+      : null,
   };
 }
 
@@ -111,6 +131,8 @@ async function assertEditorMedia(document: PageDocument) {
 }
 
 export async function registerRoutes(app: FastifyInstance, env: Env, storage: MediaStorage) {
+  registerMaintenanceGuard(app, env);
+
   app.get("/api/v1/health", async () => {
     await prisma.$queryRaw`SELECT 1`;
     return { data: { status: "ok" } };
@@ -118,28 +140,36 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
 
   app.get("/api/v1/catalog/products", async (request) => {
     const query = parse(listQuery, request.query);
-    const where = {
-      deletedAt: null,
-      status: "ACTIVE" as const,
+    const empty = { data: [], meta: { page: query.page, pageSize: query.pageSize, total: 0 } };
+    const filters: Prisma.ProductWhereInput[] = [];
+    let sort: "newest" | "name" | "price_asc" | "price_desc" | "manual" = query.sort ?? "newest";
+    let manualCollectionId: string | undefined;
+    if (query.category) {
+      const categories = await prisma.category.findMany({ where: { deletedAt: null } });
+      const category = categories.find((row) => row.slug === query.category);
+      const visible = visibleCategoryIds(categories);
+      if (!category || !visible.has(category.id)) return empty;
+      const ids = descendantIds(categories, category.id).filter((id) => visible.has(id));
+      filters.push({ categories: { some: { categoryId: { in: ids } } } });
+    }
+    if (query.collection) {
+      const collection = await prisma.collection.findFirst({ where: { slug: query.collection, deletedAt: null, isVisible: true } });
+      if (!collection) return empty;
+      filters.push(await collectionProductWhere(collection));
+      if (!query.sort) {
+        sort = storeSortFor(collection);
+        manualCollectionId = collection.id;
+      }
+    }
+    const where: Prisma.ProductWhereInput = {
+      ...STORE_PRODUCT_WHERE,
       ...(query.q ? { OR: [{ name: { contains: query.q, mode: "insensitive" as const } }, { summary: { contains: query.q, mode: "insensitive" as const } }] } : {}),
-      ...(query.category ? { categories: { some: { category: { slug: query.category, deletedAt: null } } } } : {}),
-      ...(query.collection ? { collections: { some: { collection: { slug: query.collection, deletedAt: null } } } } : {}),
+      ...(filters.length ? { AND: filters } : {}),
     };
-    const orderBy = query.sort === "name" ? { name: "asc" as const } : { createdAt: "desc" as const };
-    if (query.sort === "price_asc" || query.sort === "price_desc") {
-      const priced = await prisma.product.findMany({
-        where,
-        select: {
-          id: true,
-          variants: { where: { deletedAt: null, isDefault: true }, select: { priceAmount: true }, take: 1 },
-        },
-      });
-      priced.sort((a, b) => {
-        const ap = a.variants[0]?.priceAmount ?? 0;
-        const bp = b.variants[0]?.priceAmount ?? 0;
-        return query.sort === "price_asc" ? ap - bp : bp - ap;
-      });
-      const pageIds = priced.slice((query.page - 1) * query.pageSize, query.page * query.pageSize).map((row) => row.id);
+    const orderBy = sort === "name" ? { name: "asc" as const } : { createdAt: "desc" as const };
+    if (sort === "price_asc" || sort === "price_desc" || sort === "manual") {
+      const ids = await orderedProductIds(where, sort, manualCollectionId);
+      const pageIds = ids.slice((query.page - 1) * query.pageSize, query.page * query.pageSize);
       const rows = await prisma.product.findMany({ where: { id: { in: pageIds } }, include: publicProductInclude });
       const byId = new Map(rows.map((row) => [row.id, row]));
       return {
@@ -147,7 +177,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
           const row = byId.get(id);
           return row ? [serializeProduct(row)] : [];
         }),
-        meta: { page: query.page, pageSize: query.pageSize, total: priced.length },
+        meta: { page: query.page, pageSize: query.pageSize, total: ids.length },
       };
     }
     const [total, rows] = await prisma.$transaction([
@@ -174,33 +204,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     return { data: { ...serializeProduct(product), seo } };
   });
 
-  app.get("/api/v1/catalog/categories", async () => {
-    const rows = await prisma.category.findMany({ where: { deletedAt: null }, orderBy: { sortOrder: "asc" } });
-    return { data: rows.map((row) => ({ id: row.id, slug: row.slug, name: row.name, description: row.description, parentId: row.parentId })) };
-  });
-
-  app.get("/api/v1/catalog/categories/:slug", async (request) => {
-    const { slug } = parse(z.object({ slug: z.string() }), request.params);
-    const category = await prisma.category.findFirst({ where: { slug, deletedAt: null } });
-    if (!category) throw notFound("Kategori bulunamadı.");
-    const seo = await prisma.seoMetadata.findUnique({ where: { entityType_entityId: { entityType: "category", entityId: category.id } } });
-    return { data: { id: category.id, slug: category.slug, name: category.name, description: category.description, seo } };
-  });
-
-  app.get("/api/v1/catalog/collections", async () => {
-    const rows = await prisma.collection.findMany({ where: { deletedAt: null }, orderBy: { sortOrder: "asc" } });
-    return {
-      data: rows.map((row) => ({ id: row.id, slug: row.slug, name: row.name, description: row.description })),
-    };
-  });
-
-  app.get("/api/v1/catalog/collections/:slug", async (request) => {
-    const { slug } = parse(z.object({ slug: z.string() }), request.params);
-    const collection = await prisma.collection.findFirst({ where: { slug, deletedAt: null } });
-    if (!collection) throw notFound("Koleksiyon bulunamadı.");
-    const seo = await prisma.seoMetadata.findUnique({ where: { entityType_entityId: { entityType: "collection", entityId: collection.id } } });
-    return { data: { id: collection.id, slug: collection.slug, name: collection.name, description: collection.description, seo } };
-  });
+  registerTaxonomyRoutes(app, env);
 
   app.get("/api/v1/content/posts", async () => {
     const rows = await prisma.blogPost.findMany({
@@ -238,18 +242,9 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     return { data: { slug: page.slug, title: page.title, document, seo } };
   });
 
-  app.get("/api/v1/content/menus/:key", async (request) => {
-    const { key } = parse(z.object({ key: z.string() }), request.params);
-    const menu = await prisma.menu.findUnique({ where: { key }, include: { items: { orderBy: { sortOrder: "asc" } } } });
-    if (!menu) throw notFound("Menü bulunamadı.");
-    return { data: { key: menu.key, name: menu.name, items: menu.items.filter((item) => !item.parentId).map((item) => ({ label: item.label, href: item.href })) } };
-  });
+  registerMenuRoutes(app, env);
 
-  app.get("/api/v1/settings/public", async () => {
-    const rows = await prisma.siteSetting.findMany();
-    const settings = Object.fromEntries(rows.map((row) => [row.key, row.value]));
-    return { data: settings };
-  });
+  registerSettingsRoutes(app, env);
 
   app.get("/api/v1/seo/paths", async () => {
     const [products, categories, collections, pages, posts] = await Promise.all([
@@ -293,7 +288,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
   app.get("/api/v1/carts/current", async (request) => {
     const token = request.headers["x-cart-token"];
     const cart = await findCart(typeof token === "string" ? token : undefined);
-    return { data: serializeCart(cart) };
+    return { data: await serializeCart(cart) };
   });
 
   app.post("/api/v1/carts/current/items", async (request) => {
@@ -317,7 +312,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
       });
     }
     await prisma.cart.update({ where: { id: cart.id }, data: { expiresAt: cartExpiry() } });
-    return { data: serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
+    return { data: await serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
   });
 
   app.patch("/api/v1/carts/current/items/:itemId", async (request) => {
@@ -330,7 +325,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     const available = (item.variant.inventory?.onHand ?? 0) - (item.variant.inventory?.reserved ?? 0);
     if (body.quantity > available) throw new AppError(409, "INSUFFICIENT_STOCK", "İstenen adet stokta yok.");
     await prisma.cartItem.update({ where: { id: item.id }, data: { quantity: body.quantity } });
-    return { data: serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
+    return { data: await serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
   });
 
   app.delete("/api/v1/carts/current/items/:itemId", async (request) => {
@@ -340,7 +335,7 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
     const item = cart.items.find((entry) => entry.id === params.itemId);
     if (!item) throw notFound("Sepet satırı bulunamadı.");
     await prisma.cartItem.delete({ where: { id: item.id } });
-    return { data: serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
+    return { data: await serializeCart(await findCart(typeof token === "string" ? token : undefined)) };
   });
 
   app.get("/api/v1/checkout/payment-config", async () => ({ data: await checkoutPaymentOptions(env) }));
@@ -528,18 +523,8 @@ export async function registerRoutes(app: FastifyInstance, env: Env, storage: Me
   });
 
   registerProductAdminRoutes(app, env);
-
-  app.get("/api/v1/admin/categories", async (request) => {
-    await requireStaff(request, env);
-    const rows = await prisma.category.findMany({ where: { deletedAt: null }, orderBy: { sortOrder: "asc" } });
-    return { data: rows };
-  });
-
-  app.get("/api/v1/admin/collections", async (request) => {
-    await requireStaff(request, env);
-    const rows = await prisma.collection.findMany({ where: { deletedAt: null }, orderBy: { sortOrder: "asc" } });
-    return { data: rows };
-  });
+  registerInventoryRoutes(app, env);
+  registerAttributeRoutes(app, env);
 
   registerOrderAdminRoutes(app, env);
 

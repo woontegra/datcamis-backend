@@ -56,13 +56,15 @@ function itemImage(item: {
 
 export function bankFromMeta(value: Prisma.JsonValue | null) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return { bankName: "", accountHolder: "", iban: "" };
+    return { bankName: "", accountHolder: "", iban: "", paymentDueDays: null };
   }
   const row = value as Record<string, unknown>;
+  const days = typeof row.paymentDueDays === "number" && Number.isInteger(row.paymentDueDays) && row.paymentDueDays > 0 ? row.paymentDueDays : null;
   return {
     bankName: String(row.bankName ?? "").trim(),
     accountHolder: String(row.accountHolder ?? "").trim(),
     iban: String(row.iban ?? "").replace(/\s+/g, "").toUpperCase(),
+    paymentDueDays: days,
   };
 }
 
@@ -79,6 +81,8 @@ export async function loadThanksByAccessKey(accessKey: string) {
   const bank = havale ? bankFromMeta(payment.metadata) : null;
   return {
     number: order.number,
+    subtotalAmount: order.subtotalAmount,
+    shippingAmount: order.shippingAmount,
     totalAmount: order.totalAmount,
     paid,
     paymentProvider: payment?.provider === "havale" ? "havale" : payment?.provider === "paytr" ? "paytr" : "other",
